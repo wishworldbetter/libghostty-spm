@@ -1,0 +1,277 @@
+diff --git a/src/terminal/Terminal.zig b/src/terminal/Terminal.zig
+index 3bcfdf5..6a7be16 100644
+--- a/src/terminal/Terminal.zig
++++ b/src/terminal/Terminal.zig
+@@ -2428,6 +2428,66 @@ fn rowWillBeShifted(
+ // a single shared helper function, probably on `Screen` not here.
+ // I'm just too lazy to do that rn :p
+ 
++/// Translate the active screen's selection so it keeps covering the same
++/// content when insertLines/deleteLines shift rows vertically within the
++/// scroll region (scrollUp/scrollDown and CSI S/T route through those, so
++/// this covers them too).
++///
++/// The region shift moves cell contents between fixed row slots, so tracked
++/// pins - which anchor to a row slot - keep pointing at the old location
++/// while the content moves away. True scrolling (page list movement) already
++/// translates tracked pins; this brings in-place region scrolling to parity
++/// for the selection specifically.
++///
++/// Must be called while the cursor is still at the top of the affected range
++/// (both insertLines and deleteLines operate on rows
++/// [cursor.y, scrolling_region.bottom]) and before any rows are moved.
++///
++/// delta is the number of rows the region content moves: positive is down
++/// (insertLines), negative is up (deleteLines). A selection endpoint whose
++/// row content is destroyed by the shift clears the whole selection.
++fn shiftSelectionForRegionScroll(self: *Terminal, delta: isize) void {
++    const screen = self.screens.active;
++    const sel = if (screen.selection) |*v| v else return;
++
++    const top: usize = screen.cursor.y;
++    const bottom: usize = self.scrolling_region.bottom;
++
++    // With left/right margins only a horizontal slice of each row moves.
++    // A selection can't follow a partial-row move, so clear it if it
++    // touches the affected rows at all.
++    const left_right = self.scrolling_region.left > 0 or
++        self.scrolling_region.right < self.cols - 1;
++
++    const pins = [2]*PageList.Pin{ sel.startPtr(), sel.endPtr() };
++    var moved: [2]?PageList.Pin = .{ null, null };
++    for (pins, 0..) |p, i| {
++        // Pins outside the active area (history) never move: the region
++        // shift only rewrites active rows.
++        const pt = screen.pages.pointFromPin(.active, p.*) orelse continue;
++        const y: usize = @intCast(pt.coord().y);
++        if (y < top or y > bottom) continue;
++        if (left_right) return screen.clearSelection();
++        if (delta > 0) {
++            const d: usize = @intCast(delta);
++            // Content originally in the bottom d rows of the range is lost.
++            if (y + d > bottom) return screen.clearSelection();
++            moved[i] = p.down(d).?;
++        } else {
++            const d: usize = @intCast(-delta);
++            // Content originally in the top d rows of the range is lost.
++            if (y < top + d) return screen.clearSelection();
++            moved[i] = p.up(d).?;
++        }
++    }
++
++    for (pins, moved) |p, m| {
++        const new_pin = m orelse continue;
++        p.* = new_pin;
++        screen.dirty.selection = true;
++    }
++}
++
+ /// Insert amount lines at the current cursor row. The contents of the line
+ /// at the current cursor row and below (to the bottom-most line in the
+ /// scrolling region) are shifted down by amount lines. The contents of the
+@@ -2481,6 +2541,10 @@ pub fn insertLines(self: *Terminal, count: usize) void {
+     // region. So we take whichever is smaller.
+     const adjusted_count = @min(count, rem);
+ 
++    // Keep the selection glued to the content it covers; the loop below
++    // moves content between row slots without moving tracked pins.
++    self.shiftSelectionForRegionScroll(@intCast(adjusted_count));
++
+     // Create a new tracked pin which we'll use to navigate the page list
+     // so that if we need to adjust capacity it will be properly tracked.
+     var cur_p = self.screens.active.pages.trackPin(
+@@ -2681,6 +2745,10 @@ pub fn deleteLines(self: *Terminal, count: usize) void {
+     // region. So we take whichever is smaller.
+     const adjusted_count = @min(count, rem);
+ 
++    // Keep the selection glued to the content it covers; the loop below
++    // moves content between row slots without moving tracked pins.
++    self.shiftSelectionForRegionScroll(-@as(isize, @intCast(adjusted_count)));
++
+     // Create a new tracked pin which we'll use to navigate the page list
+     // so that if we need to adjust capacity it will be properly tracked.
+     var cur_p = self.screens.active.pages.trackPin(
+@@ -14268,3 +14336,183 @@ test "Terminal: glyph APC stores session glossary entries" {
+     t.fullReset();
+     try testing.expect(!t.glyph_glossary.contains(0xE0A0));
+ }
++
++test "Terminal: deleteLines translates selection up (in-place region scroll)" {
++    const Selection = @import("Selection.zig");
++    const alloc = testing.allocator;
++    var t = try init(alloc, .{ .rows = 5, .cols = 5 });
++    defer t.deinit(alloc);
++
++    try t.printString("AAA");
++    t.carriageReturn();
++    try t.linefeed();
++    try t.printString("BBB");
++    t.carriageReturn();
++    try t.linefeed();
++    try t.printString("CCC");
++
++    const screen = t.screens.active;
++    try screen.select(Selection.init(
++        screen.pages.pin(.{ .active = .{ .x = 0, .y = 1 } }).?,
++        screen.pages.pin(.{ .active = .{ .x = 2, .y = 1 } }).?,
++        false,
++    ));
++
++    t.setCursorPos(1, 1);
++    t.deleteLines(1);
++
++    const sel = screen.selection.?;
++    try testing.expectEqual(
++        point.Point{ .active = .{ .x = 0, .y = 0 } },
++        screen.pages.pointFromPin(.active, sel.start()).?,
++    );
++    const str = try screen.selectionString(alloc, .{ .sel = sel });
++    defer alloc.free(str);
++    try testing.expectEqualStrings("BBB", str);
++}
++
++test "Terminal: insertLines translates selection down (in-place region scroll)" {
++    const Selection = @import("Selection.zig");
++    const alloc = testing.allocator;
++    var t = try init(alloc, .{ .rows = 5, .cols = 5 });
++    defer t.deinit(alloc);
++
++    try t.printString("AAA");
++    t.carriageReturn();
++    try t.linefeed();
++    try t.printString("BBB");
++
++    const screen = t.screens.active;
++    try screen.select(Selection.init(
++        screen.pages.pin(.{ .active = .{ .x = 0, .y = 1 } }).?,
++        screen.pages.pin(.{ .active = .{ .x = 2, .y = 1 } }).?,
++        false,
++    ));
++
++    t.setCursorPos(1, 1);
++    t.insertLines(1);
++
++    const sel = screen.selection.?;
++    try testing.expectEqual(
++        point.Point{ .active = .{ .x = 0, .y = 2 } },
++        screen.pages.pointFromPin(.active, sel.start()).?,
++    );
++    const str = try screen.selectionString(alloc, .{ .sel = sel });
++    defer alloc.free(str);
++    try testing.expectEqualStrings("BBB", str);
++}
++
++test "Terminal: insertLines translates selection within scroll region" {
++    const Selection = @import("Selection.zig");
++    const alloc = testing.allocator;
++    var t = try init(alloc, .{ .rows = 5, .cols = 5 });
++    defer t.deinit(alloc);
++
++    for ("ABCDE", 0..) |c, i| {
++        t.setCursorPos(i + 1, 1);
++        try t.printString(&.{ c, c, c });
++    }
++
++    const screen = t.screens.active;
++    try screen.select(Selection.init(
++        screen.pages.pin(.{ .active = .{ .x = 0, .y = 2 } }).?,
++        screen.pages.pin(.{ .active = .{ .x = 2, .y = 2 } }).?,
++        false,
++    ));
++
++    // DECSTBM rows 2-4 (1-based), cursor at region top: tmux copy-mode shape.
++    t.setTopAndBottomMargin(2, 4);
++    t.setCursorPos(2, 1);
++    t.insertLines(1);
++
++    const sel = screen.selection.?;
++    try testing.expectEqual(
++        point.Point{ .active = .{ .x = 0, .y = 3 } },
++        screen.pages.pointFromPin(.active, sel.start()).?,
++    );
++    const str = try screen.selectionString(alloc, .{ .sel = sel });
++    defer alloc.free(str);
++    try testing.expectEqualStrings("CCC", str);
++}
++
++test "Terminal: insertLines clears selection pushed out of region" {
++    const Selection = @import("Selection.zig");
++    const alloc = testing.allocator;
++    var t = try init(alloc, .{ .rows = 3, .cols = 5 });
++    defer t.deinit(alloc);
++
++    try t.printString("AAA");
++    t.carriageReturn();
++    try t.linefeed();
++    try t.printString("BBB");
++    t.carriageReturn();
++    try t.linefeed();
++    try t.printString("CCC");
++
++    const screen = t.screens.active;
++    try screen.select(Selection.init(
++        screen.pages.pin(.{ .active = .{ .x = 0, .y = 2 } }).?,
++        screen.pages.pin(.{ .active = .{ .x = 2, .y = 2 } }).?,
++        false,
++    ));
++
++    t.setCursorPos(1, 1);
++    t.insertLines(1);
++
++    try testing.expect(screen.selection == null);
++}
++
++test "Terminal: deleteLines clears selection on deleted rows" {
++    const Selection = @import("Selection.zig");
++    const alloc = testing.allocator;
++    var t = try init(alloc, .{ .rows = 3, .cols = 5 });
++    defer t.deinit(alloc);
++
++    try t.printString("AAA");
++    t.carriageReturn();
++    try t.linefeed();
++    try t.printString("BBB");
++
++    const screen = t.screens.active;
++    try screen.select(Selection.init(
++        screen.pages.pin(.{ .active = .{ .x = 0, .y = 0 } }).?,
++        screen.pages.pin(.{ .active = .{ .x = 2, .y = 0 } }).?,
++        false,
++    ));
++
++    t.setCursorPos(1, 1);
++    t.deleteLines(1);
++
++    try testing.expect(screen.selection == null);
++}
++
++test "Terminal: insertLines leaves selection above cursor untouched" {
++    const Selection = @import("Selection.zig");
++    const alloc = testing.allocator;
++    var t = try init(alloc, .{ .rows = 5, .cols = 5 });
++    defer t.deinit(alloc);
++
++    try t.printString("AAA");
++    t.carriageReturn();
++    try t.linefeed();
++    try t.printString("BBB");
++
++    const screen = t.screens.active;
++    try screen.select(Selection.init(
++        screen.pages.pin(.{ .active = .{ .x = 0, .y = 0 } }).?,
++        screen.pages.pin(.{ .active = .{ .x = 2, .y = 0 } }).?,
++        false,
++    ));
++
++    t.setCursorPos(3, 1);
++    t.insertLines(1);
++
++    const sel = screen.selection.?;
++    try testing.expectEqual(
++        point.Point{ .active = .{ .x = 0, .y = 0 } },
++        screen.pages.pointFromPin(.active, sel.start()).?,
++    );
++    const str = try screen.selectionString(alloc, .{ .sel = sel });
++    defer alloc.free(str);
++    try testing.expectEqualStrings("AAA", str);
++}
