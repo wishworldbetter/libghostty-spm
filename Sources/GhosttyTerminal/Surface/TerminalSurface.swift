@@ -333,10 +333,10 @@ public final class TerminalSurface {
         var out = ghostty_selection_s()
         guard ghostty_surface_selection_info(s, &out) else { return nil }
         let region = SelectionRegion(
-            tlX: Int(out.tl.x),
-            tlY: Int(out.tl.y),
-            brX: Int(out.br.x),
-            brY: Int(out.br.y),
+            tlX: Int(out.top_left.x),
+            tlY: Int(out.top_left.y),
+            brX: Int(out.bottom_right.x),
+            brY: Int(out.bottom_right.y),
             rectangle: out.rectangle
         )
         TerminalDebugLog.log(
@@ -355,13 +355,13 @@ public final class TerminalSurface {
             return false
         }
         var sel = ghostty_selection_s()
-        sel.tl = ghostty_point_s(
+        sel.top_left = ghostty_point_s(
             tag: GHOSTTY_POINT_ACTIVE,
             coord: GHOSTTY_POINT_COORD_EXACT,
             x: UInt32(clamping: region.tlX),
             y: UInt32(clamping: region.tlY)
         )
-        sel.br = ghostty_point_s(
+        sel.bottom_right = ghostty_point_s(
             tag: GHOSTTY_POINT_ACTIVE,
             coord: GHOSTTY_POINT_COORD_EXACT,
             x: UInt32(clamping: region.brX),
