@@ -268,10 +268,24 @@ new_create = """        // On iOS the kqueue-based event loop used by the releas
 
         return .{"""
 
-if old_create not in src:
+# Ghostty HEAD (zig 0.16 / std.Io threading) passes an Io handle to
+# Thread.setName; try both spellings of the creation block.
+old_create_head = old_create.replace(
+    'cf_release_thr.setName("cf_release") catch {};',
+    'cf_release_thr.setName(global.io(), "cf_release") catch {};',
+)
+new_create_head = new_create.replace(
+    'thr.setName("cf_release") catch {};',
+    'thr.setName(global.io(), "cf_release") catch {};',
+)
+
+if old_create in src:
+    src = src.replace(old_create, new_create)
+elif old_create_head in src:
+    src = src.replace(old_create_head, new_create_head)
+else:
     print("[!] coretext CF release thread creation block not found")
     sys.exit(1)
-src = src.replace(old_create, new_create)
 
 # Deinit: only join/stop the thread if it was created
 old_deinit = """        // Stop the CF release thread
@@ -336,10 +350,23 @@ new_end = """        // Offload to the background release thread when available.
 
         for (items) |ref| macos.foundation.CFRelease(ref);"""
 
-if old_end not in src:
+# Ghostty HEAD threads a std.Io handle through Mailbox.push; accept both.
+old_end_head = old_end.replace(
+    "self.cf_release_thread.mailbox.push(.{ .release = .{",
+    "self.cf_release_thread.mailbox.push(global.io(), .{ .release = .{",
+)
+new_end_head = new_end.replace(
+    "thr_obj.mailbox.push(.{ .release = .{",
+    "thr_obj.mailbox.push(global.io(), .{ .release = .{",
+)
+
+if old_end in src:
+    src = src.replace(old_end, new_end)
+elif old_end_head in src:
+    src = src.replace(old_end_head, new_end_head)
+else:
     print("[!] coretext endFrame mailbox block not found")
     sys.exit(1)
-src = src.replace(old_end, new_end)
 
 path.write_text(src)
 print("[+] patched coretext.zig: CF release thread disabled on iOS")
