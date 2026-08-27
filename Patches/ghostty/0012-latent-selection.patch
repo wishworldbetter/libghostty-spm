@@ -1,5 +1,14 @@
+diff --git a/.gitattributes b/.gitattributes
+index 6ab2e8b..e0ea096 100644
+--- a/.gitattributes
++++ b/.gitattributes
+@@ -56,3 +56,4 @@ src/font/nerd_font_attributes.zig linguist-generated=true
+ src/font/nerd_font_codepoint_tables.py linguist-generated=true
+ src/font/res/** linguist-vendored
+ src/terminal/res/** linguist-vendored
++src/terminal/res/tmux_wheel_*.raw binary
 diff --git a/src/terminal/Screen.zig b/src/terminal/Screen.zig
-index 95cba1b..04b30a5 100644
+index 95cba1b..eca904e 100644
 --- a/src/terminal/Screen.zig
 +++ b/src/terminal/Screen.zig
 @@ -56,6 +56,14 @@ saved_cursor: ?SavedCursor = null,
@@ -46,10 +55,18 @@ index 95cba1b..04b30a5 100644
  }
  
  /// Same as select(null) but can't fail.
-@@ -2627,6 +2643,157 @@ pub fn clearSelection(self: *Screen) void {
+@@ -2625,6 +2641,279 @@ pub fn clearSelection(self: *Screen) void {
+         self.dirty.selection = true;
+     }
      self.selection = null;
- }
- 
++
++    // A shadow record mirrors the live selection; without a live
++    // selection it must not linger, or a long-dismissed highlight could
++    // spontaneously reappear later. (Internal demotion flips the record
++    // to a real latent *before* clearing, so it survives this.)
++    if (self.latent_selection) |lat| if (lat.shadow) self.dropLatentSelection();
++}
++
 +/// Free and forget the latent selection, if any.
 +pub fn dropLatentSelection(self: *Screen) void {
 +    if (self.latent_selection) |lat| self.alloc.free(lat.text);
@@ -69,6 +86,20 @@ index 95cba1b..04b30a5 100644
 +    bottom: usize,
 +) void {
 +    defer self.clearSelection();
++
++    // A shadow snapshot (taken at the last paint boundary, before any
++    // in-place repaints could overwrite the rows) is the authoritative
++    // record of what the user selected - the live pins may already
++    // cover repainted content. Promote it in place: its geometry has
++    // been translated by every shift alongside the pins, including the
++    // one currently in progress.
++    if (self.latent_selection) |*lat| {
++        if (lat.shadow) {
++            lat.shadow = false;
++            return;
++        }
++    }
++
 +    const sel = if (self.selection) |*v| v else return;
 +    const sp = sel.start();
 +    const ep = sel.end();
@@ -92,19 +123,26 @@ index 95cba1b..04b30a5 100644
 +    };
 +}
 +
-+/// Attempt to restore a latent selection: only once both endpoints lie on
-+/// visible rows and the content there is byte-identical to the captured
-+/// text. Cheap no-op when no latent selection exists, so this is safe to
-+/// call from hot-ish paths (cursor addressing) - a tmux-style repaint of
-+/// the returning rows always ends with cursor movement, which is what
-+/// triggers the successful restore.
++/// Attempt to restore a latent selection at its ledger-tracked
++/// coordinates: only once both endpoints lie on visible rows and the
++/// content there is byte-identical to the captured text. Cheap no-op when
++/// no latent selection exists (single null check), and free while the
++/// coordinates are out of view, so this is safe to call from hot-ish
++/// paths (cursor addressing, region-shift entry).
 +///
-+/// When the ledger-tracked coordinates do not match, fall back to a
-+/// bounded full-viewport content scan: the IL/DL ledger cannot see motion
-+/// a multiplexer performs via in-place repaints (large scroll jumps,
-+/// copy-mode exit overshoot), but the content itself is ground truth.
++/// This is deliberately coordinate-only. These triggers fire *mid-paint*
++/// (tmux addresses a row with CUP before printing it), so a content
++/// rescan here would mostly see half-painted frames - and, captured from
++/// real tmux, a fast wheel flick fires thousands of such triggers, which
++/// is how v2.1 burned its entire rescan budget before the content ever
++/// returned. Content rescans now happen only at paint boundaries; see
++/// latentPaintSettled.
 +pub fn attemptRestoreLatent(self: *Screen) void {
 +    const lat = self.latent_selection orelse return;
++
++    // A shadow record coexists with the live selection it mirrors and
++    // acts only at paint boundaries.
++    if (lat.shadow) return;
 +
 +    // A live (user-made) selection supersedes the latent one.
 +    if (self.selection != null) {
@@ -113,28 +151,123 @@ index 95cba1b..04b30a5 100644
 +    }
 +
 +    const rows: isize = @intCast(self.pages.rows);
-+    if (lat.start_y >= 0 and lat.start_y < rows and
-+        lat.end_y >= 0 and lat.end_y < rows)
-+    {
-+        // Bound the total work an unmatchable latent selection can cost.
-+        self.latent_selection.?.attempts += 1;
-+        if (self.latent_selection.?.attempts > latent_max_attempts) {
++    if (lat.start_y < 0 or lat.start_y >= rows or
++        lat.end_y < 0 or lat.end_y >= rows) return;
++
++    // Bound the total work an unmatchable latent selection can cost.
++    self.latent_selection.?.attempts += 1;
++    if (self.latent_selection.?.attempts > latent_max_attempts) {
++        self.dropLatentSelection();
++        return;
++    }
++
++    if (self.latentTextMatchesAt(lat, lat.start_y, lat.end_y)) {
++        _ = self.restoreLatentAt(lat.start_y, lat.end_y);
++    }
++}
++
++/// A paint frame is starting (the emitter hid the cursor - tmux brackets
++/// every repaint with DECRST/DECSET 25). Snapshot the live selection at
++/// this instant: if the upcoming frame moves content by repainting rows
++/// in place (copy-mode entry, coalesced scroll frames - captured from
++/// real tmux, a fast flick moves most of its distance this way, with no
++/// IL/DL at all), this pre-paint snapshot is the only surviving record
++/// of what the user actually selected. Near-zero cost when no live
++/// selection exists.
++pub fn latentPaintBegins(self: *Screen) void {
++    const sel = if (self.selection) |*v| v else return;
++
++    // An existing record - shadow or real latent - is older truth than
++    // whatever is on the grid now; never overwrite it here.
++    if (self.latent_selection != null) return;
++
++    // Only selections fully on active rows can be tracked through
++    // region repaints (same constraint as demoteSelectionToLatent).
++    const sp = sel.start();
++    const ep = sel.end();
++    const spt = self.pages.pointFromPin(.active, sp) orelse return;
++    const ept = self.pages.pointFromPin(.active, ep) orelse return;
++    const text = self.selectionString(self.alloc, .{
++        .sel = sel.*,
++        .trim = false,
++    }) catch return;
++    self.latent_selection = .{
++        .start_x = sp.x,
++        .start_y = @intCast(spt.coord().y),
++        .end_x = ep.x,
++        .end_y = @intCast(ept.coord().y),
++        .rectangle = sel.rectangle,
++        .text = text,
++        .shadow = true,
++    };
++}
++
++/// A paint frame completed (the emitter made the cursor visible again).
++/// This is the only trigger that ever sees the settled screen: captured
++/// from real tmux, the final repaint of a scroll-back is followed by
++/// nothing but DECSET 25 - no cursor addressing, no IL/DL - so without
++/// this hook a latent selection whose content just returned would wait
++/// forever. Near-zero cost when no latent state exists.
++pub fn latentPaintSettled(self: *Screen) void {
++    const lat = self.latent_selection orelse return;
++
++    if (lat.shadow) {
++        const sel = if (self.selection) |*v| v else {
++            // The live selection vanished without going through
++            // demotion; keep its snapshot as a real latent record.
++            self.latent_selection.?.shadow = false;
++            return;
++        };
++
++        // If the frame left the selected content in place (or the v1
++        // pin translation followed it), the shadow served its purpose.
++        const cur = self.selectionString(self.alloc, .{
++            .sel = sel.*,
++            .trim = false,
++        }) catch return;
++        defer self.alloc.free(cur);
++        if (std.mem.eql(u8, cur, lat.text)) {
 +            self.dropLatentSelection();
 +            return;
 +        }
 +
-+        if (self.latentTextMatchesAt(lat, lat.start_y, lat.end_y)) {
-+            _ = self.restoreLatentAt(lat.start_y, lat.end_y);
-+            return;
-+        }
++        // The frame moved content out from under the live selection.
++        // If the exact text is elsewhere in the viewport, re-anchor the
++        // highlight to it (latentRescan restores via select(), which
++        // replaces the live selection and retires the record). If it is
++        // not in view - scrolled beyond the screen, or overwritten for
++        // good - keep the live selection as upstream would, and keep
++        // the shadow: the text may scroll back later. The scan cap
++        // below garbage-collects a shadow that never matches again.
++        self.latent_selection.?.shadow = false;
++        if (self.latentRescan()) return;
++        self.latent_selection.?.shadow = true;
++        self.latent_selection.?.scans += 1;
++        if (self.latent_selection.?.scans > latent_max_scans)
++            self.dropLatentSelection();
++        return;
 +    }
 +
-+    // Tracked coordinates are wrong or out of view: recover by content.
-+    // The scan cap doubles as garbage collection for forgotten latents.
++    // No live selection: coordinate attempt first (the IL/DL ledger is
++    // exact when tmux scrolls incrementally), then a full content
++    // rescan - the ledger cannot see motion performed via in-place
++    // repaints, but the content itself is ground truth. One rescan per
++    // completed frame is bounded work; the cap doubles as garbage
++    // collection for a latent selection that never matches again.
 +    self.latent_selection.?.scans += 1;
 +    if (self.latent_selection.?.scans > latent_max_scans) {
 +        self.dropLatentSelection();
 +        return;
++    }
++
++    const rows: isize = @intCast(self.pages.rows);
++    if (lat.start_y >= 0 and lat.start_y < rows and
++        lat.end_y >= 0 and lat.end_y < rows)
++    {
++        if (self.latentTextMatchesAt(lat, lat.start_y, lat.end_y)) {
++            _ = self.restoreLatentAt(lat.start_y, lat.end_y);
++            return;
++        }
 +    }
 +    _ = self.latentRescan();
 +}
@@ -199,12 +332,66 @@ index 95cba1b..04b30a5 100644
 +    }
 +    const sy = best orelse return false;
 +    return self.restoreLatentAt(sy, sy + dy);
-+}
-+
+ }
+ 
  pub const SelectionString = struct {
-     /// The selection to convert to a string.
-     sel: Selection,
-@@ -10944,3 +11111,34 @@ test "Screen: promptClickMove click right of input cursor on last char" {
+@@ -8848,8 +9137,11 @@ test "Screen: selectWord" {
+ 
+     // Default boundary codepoints for word selection
+     const boundary_codepoints = &[_]u21{
+-        0,   ' ', '\t', '\'', '"', '│', '`', '|', ':', ';',
+-        ',', '(', ')',  '[',  ']', '{',   '}', '<', '>', '$',
++        0,   ' ', '\t', '\'', '"',
++        '│',
++        '`', '|', ':',  ';',  ',',
++        '(', ')', '[',  ']',  '{',
++        '}', '<', '>',  '$',
+     };
+ 
+     // Outside of active area
+@@ -8969,8 +9261,11 @@ test "Screen: selectWord across soft-wrap" {
+ 
+     // Default boundary codepoints for word selection
+     const boundary_codepoints = &[_]u21{
+-        0,   ' ', '\t', '\'', '"', '│', '`', '|', ':', ';',
+-        ',', '(', ')',  '[',  ']', '{',   '}', '<', '>', '$',
++        0,   ' ', '\t', '\'', '"',
++        '│',
++        '`', '|', ':',  ';',  ',',
++        '(', ')', '[',  ']',  '{',
++        '}', '<', '>',  '$',
+     };
+ 
+     {
+@@ -9041,8 +9336,11 @@ test "Screen: selectWord whitespace across soft-wrap" {
+ 
+     // Default boundary codepoints for word selection
+     const boundary_codepoints = &[_]u21{
+-        0,   ' ', '\t', '\'', '"', '│', '`', '|', ':', ';',
+-        ',', '(', ')',  '[',  ']', '{',   '}', '<', '>', '$',
++        0,   ' ', '\t', '\'', '"',
++        '│',
++        '`', '|', ':',  ';',  ',',
++        '(', ')', '[',  ']',  '{',
++        '}', '<', '>',  '$',
+     };
+ 
+     // Going forward
+@@ -9103,8 +9401,11 @@ test "Screen: selectWord with character boundary" {
+ 
+     // Default boundary codepoints for word selection
+     const boundary_codepoints = &[_]u21{
+-        0,   ' ', '\t', '\'', '"', '│', '`', '|', ':', ';',
+-        ',', '(', ')',  '[',  ']', '{',   '}', '<', '>', '$',
++        0,   ' ', '\t', '\'', '"',
++        '│',
++        '`', '|', ':',  ';',  ',',
++        '(', ')', '[',  ']',  '{',
++        '}', '<', '>',  '$',
+     };
+ 
+     const cases = [_][]const u8{
+@@ -10944,3 +11245,47 @@ test "Screen: promptClickMove click right of input cursor on last char" {
      try testing.expectEqual(@as(usize, 1), result.right);
      try testing.expectEqual(@as(usize, 0), result.left);
  }
@@ -226,11 +413,24 @@ index 95cba1b..04b30a5 100644
 +    /// In-view restore attempts so far; bounded so a never-matching latent
 +    /// selection cannot cost extraction work forever.
 +    attempts: usize = 0,
-+    /// Full-viewport content rescans so far. Rescans recover from motion
-+    /// the IL/DL ledger cannot see (multiplexers repaint in place on large
-+    /// jumps); the cap doubles as garbage collection - sustained screen
-+    /// activity without a match means the user moved on.
++    /// Completed paint frames that ran a full-viewport content rescan
++    /// without a match. Rescans recover from motion the IL/DL ledger
++    /// cannot see (multiplexers repaint in place on large jumps) and are
++    /// charged only once per settled frame - never from the mid-paint
++    /// CUP/IL/DL triggers, which fire thousands of times during a single
++    /// wheel flick. The cap doubles as garbage collection - sustained
++    /// screen activity without a match means the user moved on.
 +    scans: usize = 0,
++    /// A shadow record mirrors a live selection that still exists: it is
++    /// the pre-paint snapshot taken when the emitter hid the cursor to
++    /// start a frame (latentPaintBegins). In-place repaints overwrite
++    /// selected rows without any hook firing, so by demotion time the
++    /// pins may cover repainted content - the shadow preserves the text
++    /// the user actually selected. It is resolved at frame completion
++    /// (latentPaintSettled): dropped when the live selection still
++    /// matches, used to re-anchor when the content moved within view,
++    /// promoted to a real latent record on demotion.
++    shadow: bool = false,
 +};
 +
 +/// Attempts allowed while the latent geometry is fully in view before the
@@ -240,7 +440,7 @@ index 95cba1b..04b30a5 100644
 +/// Viewport content rescans allowed before the latent selection is dropped.
 +const latent_max_scans = 512;
 diff --git a/src/terminal/Terminal.zig b/src/terminal/Terminal.zig
-index 6a7be16..b7f854b 100644
+index 6a7be16..a083885 100644
 --- a/src/terminal/Terminal.zig
 +++ b/src/terminal/Terminal.zig
 @@ -2092,6 +2092,12 @@ pub fn reverseIndex(self: *Terminal) void {
@@ -307,7 +507,49 @@ index 6a7be16..b7f854b 100644
              moved[i] = p.up(d).?;
          }
      }
-@@ -14516,3 +14540,175 @@ test "Terminal: insertLines leaves selection above cursor untouched" {
+@@ -2488,6 +2512,23 @@ fn shiftSelectionForRegionScroll(self: *Terminal, delta: isize) void {
+     }
+ }
+ 
++/// Cursor visibility changed via DECSET/DECRST 25. Multiplexers such as
++/// tmux bracket every repaint frame with hide/show, which makes these the
++/// only reliable "frame starting" / "frame settled" signals in the byte
++/// stream: captured from a real tmux scroll-back, the final repaint that
++/// brings content back into view is followed by nothing but DECSET 25 -
++/// no cursor addressing, no IL/DL - so the latent selection machinery
++/// keys off this. Near-zero cost when no selection or latent state
++/// exists. Mode state itself is owned by the stream handlers; they call
++/// this in addition to setting the mode.
++pub fn cursorVisibilityChanged(self: *Terminal, visible: bool) void {
++    if (visible) {
++        self.screens.active.latentPaintSettled();
++    } else {
++        self.screens.active.latentPaintBegins();
++    }
++}
++
+ /// Insert amount lines at the current cursor row. The contents of the line
+ /// at the current cursor row and below (to the bottom-most line in the
+ /// scrolling region) are shifted down by amount lines. The contents of the
+@@ -12489,11 +12530,12 @@ fn testPrintSliceDifferential(
+     // Alphabet of interesting codepoints: ascii, latin-1, combining
+     // marks, CJK (wide), emoji (wide), ZWJ, variation selectors.
+     const alphabet = [_]u21{
+-        'a',     'b',     'Z',     '0',    ' ',    0x10,    0x1F,   0x7F,
+-        'é',    0xFF,    0x301,   0x4E00, 0x4E01, 0x1F600, 0x200D, 0xFE0F,
+-        'x',     'y',     0x1F9D1, 0x0308, 0xAD,   0x3042,  0xAC00, 'q',
+-        'r',     's',     't',     'u',    'v',    'w',     '1',    '2',
+-        0x1F1E6, 0x1F1E7, 0x1100,  0x1161, 0x11A8, 0x200C,  0x0430, 0x03B1,
++        'a',     'b',     'Z',    '0',    ' ',     0x10,   0x1F,   0x7F,
++        'é',
++        0xFF,    0x301,   0x4E00, 0x4E01, 0x1F600, 0x200D, 0xFE0F, 'x',
++        'y',     0x1F9D1, 0x0308, 0xAD,   0x3042,  0xAC00, 'q',    'r',
++        's',     't',     'u',    'v',    'w',     '1',    '2',    0x1F1E6,
++        0x1F1E7, 0x1100,  0x1161, 0x11A8, 0x200C,  0x0430, 0x03B1,
+     };
+ 
+     var cps_buf: [64]u32 = undefined;
+@@ -14516,3 +14558,382 @@ test "Terminal: insertLines leaves selection above cursor untouched" {
      defer alloc.free(str);
      try testing.expectEqualStrings("AAA", str);
  }
@@ -468,10 +710,11 @@ index 6a7be16..b7f854b 100644
 +
 +    // Simulate a multiplexer repainting in place after a jump the IL/DL
 +    // ledger never saw: the content reappears at row 1, not where the
-+    // ledger expects it. The rescan must find it by content.
++    // ledger expects it. The rescan runs at frame completion (DECSET 25)
++    // and must find it by content.
 +    t.setCursorPos(2, 1);
 +    try t.printString("CCC");
-+    t.setCursorPos(1, 1);
++    t.cursorVisibilityChanged(true);
 +
 +    const sel = screen.selection orelse return error.TestExpectedRescanRestore;
 +    try testing.expect(screen.latent_selection == null);
@@ -483,3 +726,459 @@ index 6a7be16..b7f854b 100644
 +    defer alloc.free(str);
 +    try testing.expectEqualStrings("CCC", str);
 +}
++
++test "Terminal: latent selection restores at frame completion without cursor addressing" {
++    const Selection = @import("Selection.zig");
++    const alloc = testing.allocator;
++    var t = try init(alloc, .{ .rows = 5, .cols = 5 });
++    defer t.deinit(alloc);
++
++    for ("ABCDE", 0..) |c, i| {
++        t.setCursorPos(i + 1, 1);
++        try t.printString(&.{ c, c, c });
++    }
++
++    const screen = t.screens.active;
++    try screen.select(Selection.init(
++        screen.pages.pin(.{ .active = .{ .x = 0, .y = 2 } }).?,
++        screen.pages.pin(.{ .active = .{ .x = 2, .y = 2 } }).?,
++        false,
++    ));
++
++    t.setCursorPos(1, 1);
++    t.insertLines(3);
++    try testing.expect(screen.latent_selection != null);
++
++    // Bring the content back: DL, then repaint the returning row exactly
++    // the way tmux ends a frame - the row is addressed *before* its text
++    // is printed, and after the last glyph nothing follows but the
++    // cursor being shown again (captured from real tmux; see the
++    // stream_terminal.zig capture tests).
++    t.deleteLines(3);
++    t.setCursorPos(3, 1);
++    try t.printString("CCC");
++
++    // No trigger has seen the finished content yet.
++    try testing.expect(screen.selection == null);
++    try testing.expect(screen.latent_selection != null);
++
++    // Frame completion (DECSET 25) must restore it.
++    t.cursorVisibilityChanged(true);
++    const sel = screen.selection orelse return error.TestExpectedRestore;
++    const str = try screen.selectionString(alloc, .{ .sel = sel });
++    defer alloc.free(str);
++    try testing.expectEqualStrings("CCC", str);
++}
++
++test "Terminal: latent shadow re-anchors selection after in-place repaint" {
++    const Selection = @import("Selection.zig");
++    const alloc = testing.allocator;
++    var t = try init(alloc, .{ .rows = 5, .cols = 5 });
++    defer t.deinit(alloc);
++
++    for ("ABCDE", 0..) |c, i| {
++        t.setCursorPos(i + 1, 1);
++        try t.printString(&.{ c, c, c });
++    }
++
++    const screen = t.screens.active;
++    try screen.select(Selection.init(
++        screen.pages.pin(.{ .active = .{ .x = 0, .y = 2 } }).?,
++        screen.pages.pin(.{ .active = .{ .x = 2, .y = 2 } }).?,
++        false,
++    ));
++
++    // tmux copy-mode entry: hide cursor, repaint every row in place
++    // scrolled up by one (no IL/DL at all), show cursor.
++    t.cursorVisibilityChanged(false);
++    for ("BCDEF", 0..) |c, i| {
++        t.setCursorPos(i + 1, 1);
++        try t.printString(&.{ c, c, c });
++    }
++    t.cursorVisibilityChanged(true);
++
++    // The highlight must have followed "CCC" to its new row.
++    const sel = screen.selection orelse return error.TestExpectedReanchor;
++    try testing.expect(screen.latent_selection == null);
++    try testing.expectEqual(
++        point.Point{ .active = .{ .x = 0, .y = 1 } },
++        screen.pages.pointFromPin(.active, sel.start()).?,
++    );
++    const str = try screen.selectionString(alloc, .{ .sel = sel });
++    defer alloc.free(str);
++    try testing.expectEqualStrings("CCC", str);
++}
++
++test "Terminal: latent shadow keeps live selection when content is replaced" {
++    const Selection = @import("Selection.zig");
++    const alloc = testing.allocator;
++    var t = try init(alloc, .{ .rows = 5, .cols = 5 });
++    defer t.deinit(alloc);
++
++    for ("ABCDE", 0..) |c, i| {
++        t.setCursorPos(i + 1, 1);
++        try t.printString(&.{ c, c, c });
++    }
++
++    const screen = t.screens.active;
++    try screen.select(Selection.init(
++        screen.pages.pin(.{ .active = .{ .x = 0, .y = 2 } }).?,
++        screen.pages.pin(.{ .active = .{ .x = 2, .y = 2 } }).?,
++        false,
++    ));
++
++    // A TUI-style refresh overwrites the selected row with new content
++    // that exists nowhere else. Upstream keeps the highlight in place;
++    // so do we - the shadow must not clear or move it.
++    t.cursorVisibilityChanged(false);
++    t.setCursorPos(3, 1);
++    try t.printString("XYZ");
++    t.cursorVisibilityChanged(true);
++
++    const sel = screen.selection orelse return error.TestExpectedKeep;
++    try testing.expectEqual(
++        point.Point{ .active = .{ .x = 0, .y = 2 } },
++        screen.pages.pointFromPin(.active, sel.start()).?,
++    );
++}
++
++test "Terminal: latent shadow snapshot wins over repainted pins at demotion" {
++    const Selection = @import("Selection.zig");
++    const alloc = testing.allocator;
++    var t = try init(alloc, .{ .rows = 5, .cols = 5 });
++    defer t.deinit(alloc);
++
++    for ("ABCDE", 0..) |c, i| {
++        t.setCursorPos(i + 1, 1);
++        try t.printString(&.{ c, c, c });
++    }
++
++    const screen = t.screens.active;
++    try screen.select(Selection.init(
++        screen.pages.pin(.{ .active = .{ .x = 0, .y = 2 } }).?,
++        screen.pages.pin(.{ .active = .{ .x = 2, .y = 2 } }).?,
++        false,
++    ));
++
++    // Frame 1: in-place repaint scrolls content up by two rows without
++    // IL/DL; "CCC" moves beyond reach of the shadow rescan window (it is
++    // gone from the viewport entirely in the real coalesced case; here
++    // it lands on row 0 - overwrite it too so the rescan cannot find it
++    // and the shadow must survive).
++    t.cursorVisibilityChanged(false);
++    for ("FGHIJ", 0..) |c, i| {
++        t.setCursorPos(i + 1, 1);
++        try t.printString(&.{ c, c, c });
++    }
++    t.cursorVisibilityChanged(true);
++
++    // Live selection kept (content nowhere in view), shadow retained.
++    try testing.expect(screen.selection != null);
++    {
++        const lat = screen.latent_selection orelse return error.TestExpectedShadow;
++        try testing.expect(lat.shadow);
++        try testing.expectEqualStrings("CCC", lat.text);
++    }
++
++    // Frame 2: IL pushes the (repainted) pinned rows out - demotion. The
++    // latent record must carry the pre-repaint snapshot, not the "HHH"
++    // now under the pins.
++    t.setCursorPos(1, 1);
++    t.insertLines(3);
++    try testing.expect(screen.selection == null);
++    {
++        const lat = screen.latent_selection orelse return error.TestExpectedLatent;
++        try testing.expect(!lat.shadow);
++        try testing.expectEqualStrings("CCC", lat.text);
++    }
++
++    // Frame 3: the original content returns via an in-place repaint;
++    // frame completion restores the highlight onto it.
++    t.cursorVisibilityChanged(false);
++    t.setCursorPos(2, 1);
++    try t.printString("CCC");
++    t.cursorVisibilityChanged(true);
++
++    const sel = screen.selection orelse return error.TestExpectedRestore;
++    const str = try screen.selectionString(alloc, .{ .sel = sel });
++    defer alloc.free(str);
++    try testing.expectEqualStrings("CCC", str);
++}
++
++test "Terminal: latent shadow dropped when live selection is cleared" {
++    const Selection = @import("Selection.zig");
++    const alloc = testing.allocator;
++    var t = try init(alloc, .{ .rows = 5, .cols = 5 });
++    defer t.deinit(alloc);
++
++    for ("ABCDE", 0..) |c, i| {
++        t.setCursorPos(i + 1, 1);
++        try t.printString(&.{ c, c, c });
++    }
++
++    const screen = t.screens.active;
++    try screen.select(Selection.init(
++        screen.pages.pin(.{ .active = .{ .x = 0, .y = 2 } }).?,
++        screen.pages.pin(.{ .active = .{ .x = 2, .y = 2 } }).?,
++        false,
++    ));
++
++    // Shadow taken at frame start...
++    t.cursorVisibilityChanged(false);
++    try testing.expect(screen.latent_selection != null);
++
++    // ...user dismisses the selection: the shadow must die with it, or
++    // the highlight would spontaneously reappear later.
++    screen.clearSelection();
++    try testing.expect(screen.latent_selection == null);
++}
+diff --git a/src/terminal/res/tmux_wheel_flick_attach.raw b/src/terminal/res/tmux_wheel_flick_attach.raw
+new file mode 100644
+index 0000000000000000000000000000000000000000..25f165b0cb4a1cad90b82fda2d700f6b8dbf0bf8
+GIT binary patch
+literal 1675
+zcmeH{OKQU~5Qdk5Ku(}dmffg&SbnIc4HOFLgYLRgvrudq8|>J%ozTOS9<C>;<T!K+
+z-KE)OVGsW>8a_0?2B`(3Lgq+u9@Cii$R=`hjnvYn9-QK({d3=z*iuTJvT?}T=#4rU
+zqd!zrDqKCMo^7TUQU)7zaf?*t4*za=IQUm%7Bh>%VlG;w5~Ob2_l8!C#tZanBO9XP
+zB4+*)t!TU{Y8+jbb)w4&T7_{|l;(;MkS0xA>~wEPUo|8t^)@xwr;Om2&a@rwdfnpI
+zG&QbtQg=8tJKPzQR@-;H(S5NqgeE%i1YP5`$ucZ>s<F&cj#-$cUXU5;NuP8{tNSEx
+zbUJYt;jU%*bpL#ZMHnIVIGc__0ufOt7!(`|4+;T=4@Ce)2n8gFAc2Gg5)w#AAR&Q-
+z1QHTRNFX7Bgai^0_|y>~<#B5jR?VhgpC9wN)j{=hqkAjatSy9gVv)5k6aCRv+t16n
+k?>w@DQ%^H8w@QXp5r#a>k00Fswj1}#`Tg3pb@KQ74KYiT?f?J)
+
+literal 0
+HcmV?d00001
+
+diff --git a/src/terminal/res/tmux_wheel_flick_scroll.raw b/src/terminal/res/tmux_wheel_flick_scroll.raw
+new file mode 100644
+index 0000000000000000000000000000000000000000..7b2f8892cb9449a7146b48aac17351b69683839b
+GIT binary patch
+literal 11523
+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
+
+literal 0
+HcmV?d00001
+
+diff --git a/src/terminal/res/tmux_wheel_slow_attach.raw b/src/terminal/res/tmux_wheel_slow_attach.raw
+new file mode 100644
+index 0000000000000000000000000000000000000000..ab06bff14a0ebfd2d3eca4ffca45b66a4c062796
+GIT binary patch
+literal 1754
+zcmeH{OKQU~5Qdk5Ku(}dmffg&SbnIc4HOFLgYLRgvrudq8|>J%ozTOS9<C>;<T!K+
+z-Gx9GS=hrrjE0YypFwKDsE|2QoX0e#J+g@$T_d%$sRyTcY5&}}CAO4Or)(UuHhQBD
+z#^?{#lnPhRsb`z1g_OYtUECs7xyQd79v=SHn8nOuu$YS$sRXGT_r0MNqwxa0+Q^2e
+zxQLm*L@OF^iW*0kWu549f>vRi6{Wc%1f)sR7CYS=(pL>hO1(`D_9-Lyr88}ZyI!}r
+zHBF5xozxvp%?@|Qq}BEvZ**Vm455imJVDoZZL$mto@y+!lw%fVsTX91deSFd(&|3R
+z8=X$vAlz7%PxsGvScDN$kF)70BoGmWf<eKd@SqS-_)r8;git_&2ogw0AR&Q-1QHTR
+zNFX7Bgai^2NJt<7flnO)QXaQfVbyH<_4zTMTOCwC6Wv?MW^Ey~6N{{UndpzU+J0Zo
+kedm=OoO+s-xl=NniZJA1e*EJ8b-VFQozH>2f+s%*-vxrE+yDRo
+
+literal 0
+HcmV?d00001
+
+diff --git a/src/terminal/res/tmux_wheel_slow_scroll.raw b/src/terminal/res/tmux_wheel_slow_scroll.raw
+new file mode 100644
+index 0000000000000000000000000000000000000000..2eee63fbc79be4ec22e4c7d190d82a2b2566b894
+GIT binary patch
+literal 12725
+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
+
+literal 0
+HcmV?d00001
+
+diff --git a/src/terminal/stream_terminal.zig b/src/terminal/stream_terminal.zig
+index c635e91..c5a5728 100644
+--- a/src/terminal/stream_terminal.zig
++++ b/src/terminal/stream_terminal.zig
+@@ -533,6 +533,11 @@ pub const Handler = struct {
+ 
+             .origin => self.terminal.setCursorPos(1, 1),
+ 
++            // tmux-style repaints are bracketed by hide/show cursor;
++            // the latent selection machinery keys off these frame
++            // boundaries (no-op when no selection state exists).
++            .cursor_visible => self.terminal.cursorVisibilityChanged(enabled),
++
+             .enable_left_and_right_margin => if (!enabled) {
+                 self.terminal.scrolling_region.left = 0;
+                 self.terminal.scrolling_region.right = self.terminal.cols - 1;
+@@ -2423,3 +2428,97 @@ test "kitty graphics via APC" {
+     const img = storage.imageById(1).?;
+     try testing.expectEqual(.rgb, img.format);
+ }
++
++// The following two tests replay REAL captured tmux byte streams. They were
++// recorded from tmux 3.6a driven exactly the way Seedmux's wheel bridge
++// drives it (private conf replica; `copy-mode -e` + `send-keys -X -N <n>
++// scroll-up/scroll-down` bursts against an 80x24 client, TERM=xterm-256color)
++// with the client pty output captured verbatim. See res/tmux_wheel_*.raw.
++//
++// Key empirical facts these streams encode, which hand-written IL/DL
++// sequences do not reproduce:
++//   - copy-mode entry repaints the whole screen in place (CUP home + rows
++//     separated by CR/LF + EL), moving content with NO IL/DL at all;
++//   - a fast flick coalesces in tmux: 245 scrolled lines produced only
++//     120 IL on the way out and 60 DL plus one final full repaint on the
++//     way back, so most of the motion is invisible to the IL/DL ledger;
++//   - every repaint cycle hides the cursor first (DECRST 25) and shows it
++//     again (DECSET 25) only after the last cell of the frame is painted -
++//     and after the final frame NOTHING else follows, so DECSET 25 is the
++//     only trigger that ever sees the settled screen.
++
++test "Terminal: latent selection revives across real tmux wheel flick" {
++    const Selection = @import("Selection.zig");
++    const alloc = testing.allocator;
++    var t: Terminal = try .init(alloc, .{ .cols = 80, .rows = 24 });
++    defer t.deinit(alloc);
++
++    var s: Stream = .initAlloc(alloc, .init(&t));
++    defer s.deinit();
++
++    // Attach: tmux paints LINE-478..LINE-500 on rows 0..22, prompt on 23.
++    s.nextSlice(@embedFile("res/tmux_wheel_flick_attach.raw"));
++
++    // User selects "LINE-490" (row 12).
++    const screen = t.screens.active;
++    try screen.select(Selection.init(
++        screen.pages.pin(.{ .active = .{ .x = 0, .y = 12 } }).?,
++        screen.pages.pin(.{ .active = .{ .x = 7, .y = 12 } }).?,
++        false,
++    ));
++    {
++        const before = try screen.selectionString(alloc, .{
++            .sel = screen.selection.?,
++            .trim = false,
++        });
++        defer alloc.free(before);
++        try testing.expectEqualStrings("LINE-490", before);
++    }
++
++    // The full recorded flick: burst of scroll-ups (245 lines, heavily
++    // coalesced by tmux), then a burst of scroll-downs overshooting the
++    // bottom so copy-mode auto-exits with a final full repaint.
++    s.nextSlice(@embedFile("res/tmux_wheel_flick_scroll.raw"));
++
++    // The highlight must be back on the exact text the user selected.
++    const sel = screen.selection orelse return error.TestExpectedRestore;
++    const after = try screen.selectionString(alloc, .{
++        .sel = sel,
++        .trim = false,
++    });
++    defer alloc.free(after);
++    try testing.expectEqualStrings("LINE-490", after);
++}
++
++test "Terminal: latent selection revives across real tmux slow scroll" {
++    const Selection = @import("Selection.zig");
++    const alloc = testing.allocator;
++    var t: Terminal = try .init(alloc, .{ .cols = 80, .rows = 24 });
++    defer t.deinit(alloc);
++
++    var s: Stream = .initAlloc(alloc, .init(&t));
++    defer s.deinit();
++
++    // Attach: LINE-478..LINE-500 on rows 0..22, prompt on row 23.
++    s.nextSlice(@embedFile("res/tmux_wheel_slow_attach.raw"));
++
++    const screen = t.screens.active;
++    try screen.select(Selection.init(
++        screen.pages.pin(.{ .active = .{ .x = 0, .y = 12 } }).?,
++        screen.pages.pin(.{ .active = .{ .x = 7, .y = 12 } }).?,
++        false,
++    ));
++
++    // Same wheel commands, but paced slowly so tmux drains between
++    // commands: entry full repaint (5 lines, no IL/DL!), then IL walks
++    // out 240 lines, DL walks back, and a final exit repaint.
++    s.nextSlice(@embedFile("res/tmux_wheel_slow_scroll.raw"));
++
++    const sel = screen.selection orelse return error.TestExpectedRestore;
++    const after = try screen.selectionString(alloc, .{
++        .sel = sel,
++        .trim = false,
++    });
++    defer alloc.free(after);
++    try testing.expectEqualStrings("LINE-490", after);
++}
+diff --git a/src/termio/stream_handler.zig b/src/termio/stream_handler.zig
+index 43c5d61..83ae6e0 100644
+--- a/src/termio/stream_handler.zig
++++ b/src/termio/stream_handler.zig
+@@ -711,6 +711,11 @@ pub const StreamHandler = struct {
+             // not the value changed.
+             .origin => self.terminal.setCursorPos(1, 1),
+ 
++            // tmux-style repaints are bracketed by hide/show cursor;
++            // the latent selection machinery keys off these frame
++            // boundaries (no-op when no selection state exists).
++            .cursor_visible => self.terminal.cursorVisibilityChanged(enabled),
++
+             .enable_left_and_right_margin => if (!enabled) {
+                 // When we disable left/right margin mode we need to
+                 // reset the left/right margins.
