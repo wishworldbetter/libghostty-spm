@@ -1,8 +1,8 @@
 diff --git a/src/terminal/Terminal.zig b/src/terminal/Terminal.zig
-index 3bcfdf5..6a7be16 100644
+index 0a881a3..592cc3e 100644
 --- a/src/terminal/Terminal.zig
 +++ b/src/terminal/Terminal.zig
-@@ -2428,6 +2428,66 @@ fn rowWillBeShifted(
+@@ -2930,6 +2930,66 @@ fn invalidateFullWidthRowRange(
  // a single shared helper function, probably on `Screen` not here.
  // I'm just too lazy to do that rn :p
  
@@ -69,7 +69,7 @@ index 3bcfdf5..6a7be16 100644
  /// Insert amount lines at the current cursor row. The contents of the line
  /// at the current cursor row and below (to the bottom-most line in the
  /// scrolling region) are shifted down by amount lines. The contents of the
-@@ -2481,6 +2541,10 @@ pub fn insertLines(self: *Terminal, count: usize) void {
+@@ -2983,6 +3043,10 @@ pub fn insertLines(self: *Terminal, count: usize) void {
      // region. So we take whichever is smaller.
      const adjusted_count = @min(count, rem);
  
@@ -80,7 +80,7 @@ index 3bcfdf5..6a7be16 100644
      // Create a new tracked pin which we'll use to navigate the page list
      // so that if we need to adjust capacity it will be properly tracked.
      var cur_p = self.screens.active.pages.trackPin(
-@@ -2681,6 +2745,10 @@ pub fn deleteLines(self: *Terminal, count: usize) void {
+@@ -3156,6 +3220,10 @@ pub fn deleteLines(self: *Terminal, count: usize) void {
      // region. So we take whichever is smaller.
      const adjusted_count = @min(count, rem);
  
@@ -91,9 +91,9 @@ index 3bcfdf5..6a7be16 100644
      // Create a new tracked pin which we'll use to navigate the page list
      // so that if we need to adjust capacity it will be properly tracked.
      var cur_p = self.screens.active.pages.trackPin(
-@@ -14268,3 +14336,183 @@ test "Terminal: glyph APC stores session glossary entries" {
-     t.fullReset();
-     try testing.expect(!t.glyph_glossary.contains(0xE0A0));
+@@ -16464,3 +16532,183 @@ test "Terminal: eraseDisplay complete ignores stale prompt on recycled row" {
+ 
+     try testing.expectEqual(t.screens.active.pages.rows, t.screens.active.pages.total_rows);
  }
 +
 +test "Terminal: deleteLines translates selection up (in-place region scroll)" {
