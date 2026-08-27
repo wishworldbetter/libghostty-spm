@@ -1,5 +1,5 @@
 diff --git a/src/terminal/Screen.zig b/src/terminal/Screen.zig
-index 95cba1b..7d0fbe0 100644
+index 95cba1b..04b30a5 100644
 --- a/src/terminal/Screen.zig
 +++ b/src/terminal/Screen.zig
 @@ -56,6 +56,14 @@ saved_cursor: ?SavedCursor = null,
@@ -46,7 +46,7 @@ index 95cba1b..7d0fbe0 100644
  }
  
  /// Same as select(null) but can't fail.
-@@ -2627,6 +2643,95 @@ pub fn clearSelection(self: *Screen) void {
+@@ -2627,6 +2643,157 @@ pub fn clearSelection(self: *Screen) void {
      self.selection = null;
  }
  
@@ -92,12 +92,17 @@ index 95cba1b..7d0fbe0 100644
 +    };
 +}
 +
-+/// Attempt to restore a latent selection: only once both endpoints are
-+/// back inside the active area and the content at those coordinates is
-+/// byte-identical to the captured text. Cheap no-op when no latent
-+/// selection exists, so this is safe to call from hot-ish paths (cursor
-+/// addressing) - a tmux-style repaint of the returning rows always ends
-+/// with cursor movement, which is what triggers the successful restore.
++/// Attempt to restore a latent selection: only once both endpoints lie on
++/// visible rows and the content there is byte-identical to the captured
++/// text. Cheap no-op when no latent selection exists, so this is safe to
++/// call from hot-ish paths (cursor addressing) - a tmux-style repaint of
++/// the returning rows always ends with cursor movement, which is what
++/// triggers the successful restore.
++///
++/// When the ledger-tracked coordinates do not match, fall back to a
++/// bounded full-viewport content scan: the IL/DL ledger cannot see motion
++/// a multiplexer performs via in-place repaints (large scroll jumps,
++/// copy-mode exit overshoot), but the content itself is ground truth.
 +pub fn attemptRestoreLatent(self: *Screen) void {
 +    const lat = self.latent_selection orelse return;
 +
@@ -108,41 +113,98 @@ index 95cba1b..7d0fbe0 100644
 +    }
 +
 +    const rows: isize = @intCast(self.pages.rows);
-+    if (lat.start_y < 0 or lat.start_y >= rows or
-+        lat.end_y < 0 or lat.end_y >= rows) return;
++    if (lat.start_y >= 0 and lat.start_y < rows and
++        lat.end_y >= 0 and lat.end_y < rows)
++    {
++        // Bound the total work an unmatchable latent selection can cost.
++        self.latent_selection.?.attempts += 1;
++        if (self.latent_selection.?.attempts > latent_max_attempts) {
++            self.dropLatentSelection();
++            return;
++        }
 +
-+    // Bound the total work an unmatchable latent selection can cost.
-+    self.latent_selection.?.attempts += 1;
-+    if (self.latent_selection.?.attempts > latent_max_attempts) {
++        if (self.latentTextMatchesAt(lat, lat.start_y, lat.end_y)) {
++            _ = self.restoreLatentAt(lat.start_y, lat.end_y);
++            return;
++        }
++    }
++
++    // Tracked coordinates are wrong or out of view: recover by content.
++    // The scan cap doubles as garbage collection for forgotten latents.
++    self.latent_selection.?.scans += 1;
++    if (self.latent_selection.?.scans > latent_max_scans) {
 +        self.dropLatentSelection();
 +        return;
 +    }
++    _ = self.latentRescan();
++}
 +
++/// True if the latent selection's text appears exactly at the given
++/// active-row coordinates (columns from the latent geometry).
++fn latentTextMatchesAt(self: *Screen, lat: LatentSelection, sy: isize, ey: isize) bool {
 +    const start_pin = self.pages.pin(.{ .active = .{
 +        .x = lat.start_x,
-+        .y = @intCast(lat.start_y),
-+    } }) orelse return;
++        .y = @intCast(sy),
++    } }) orelse return false;
 +    const end_pin = self.pages.pin(.{ .active = .{
 +        .x = lat.end_x,
-+        .y = @intCast(lat.end_y),
-+    } }) orelse return;
++        .y = @intCast(ey),
++    } }) orelse return false;
 +    const sel = Selection.init(start_pin, end_pin, lat.rectangle);
-+
 +    const text = self.selectionString(self.alloc, .{
 +        .sel = sel,
 +        .trim = false,
-+    }) catch return;
++    }) catch return false;
 +    defer self.alloc.free(text);
-+    if (!std.mem.eql(u8, text, lat.text)) return;
++    return std.mem.eql(u8, text, lat.text);
++}
 +
-+    // The content is back; select() also drops the latent state.
-+    self.select(sel) catch return;
++/// Re-create the real selection at the given coordinates and retire the
++/// latent state. select() drops the latent record.
++fn restoreLatentAt(self: *Screen, sy: isize, ey: isize) bool {
++    const lat = self.latent_selection orelse return false;
++    const start_pin = self.pages.pin(.{ .active = .{
++        .x = lat.start_x,
++        .y = @intCast(sy),
++    } }) orelse return false;
++    const end_pin = self.pages.pin(.{ .active = .{
++        .x = lat.end_x,
++        .y = @intCast(ey),
++    } }) orelse return false;
++    const sel = Selection.init(start_pin, end_pin, lat.rectangle);
++    self.select(sel) catch return false;
++    return true;
++}
++
++/// Scan every vertical placement of the latent geometry that fits in the
++/// viewport for an exact text match; the placement nearest the tracked
++/// position wins. Returns true when a restore happened.
++fn latentRescan(self: *Screen) bool {
++    const lat = self.latent_selection orelse return false;
++    const rows: isize = @intCast(self.pages.rows);
++    const dy = lat.end_y - lat.start_y;
++    const h: isize = @intCast(@abs(dy));
++    if (h >= rows) return false;
++
++    var best: ?isize = null;
++    var base: isize = 0;
++    while (base + h < rows) : (base += 1) {
++        const sy = if (dy >= 0) base else base + h;
++        const ey = sy + dy;
++        if (self.latentTextMatchesAt(lat, sy, ey)) {
++            if (best) |b| {
++                if (@abs(sy - lat.start_y) < @abs(b - lat.start_y)) best = sy;
++            } else best = sy;
++        }
++    }
++    const sy = best orelse return false;
++    return self.restoreLatentAt(sy, sy + dy);
 +}
 +
  pub const SelectionString = struct {
      /// The selection to convert to a string.
      sel: Selection,
-@@ -10944,3 +11049,26 @@ test "Screen: promptClickMove click right of input cursor on last char" {
+@@ -10944,3 +11111,34 @@ test "Screen: promptClickMove click right of input cursor on last char" {
      try testing.expectEqual(@as(usize, 1), result.right);
      try testing.expectEqual(@as(usize, 0), result.left);
  }
@@ -164,13 +226,21 @@ index 95cba1b..7d0fbe0 100644
 +    /// In-view restore attempts so far; bounded so a never-matching latent
 +    /// selection cannot cost extraction work forever.
 +    attempts: usize = 0,
++    /// Full-viewport content rescans so far. Rescans recover from motion
++    /// the IL/DL ledger cannot see (multiplexers repaint in place on large
++    /// jumps); the cap doubles as garbage collection - sustained screen
++    /// activity without a match means the user moved on.
++    scans: usize = 0,
 +};
 +
 +/// Attempts allowed while the latent geometry is fully in view before the
 +/// latent selection is dropped as unmatchable.
 +const latent_max_attempts = 4096;
++
++/// Viewport content rescans allowed before the latent selection is dropped.
++const latent_max_scans = 512;
 diff --git a/src/terminal/Terminal.zig b/src/terminal/Terminal.zig
-index 6a7be16..1691747 100644
+index 6a7be16..b7f854b 100644
 --- a/src/terminal/Terminal.zig
 +++ b/src/terminal/Terminal.zig
 @@ -2092,6 +2092,12 @@ pub fn reverseIndex(self: *Terminal) void {
@@ -237,7 +307,7 @@ index 6a7be16..1691747 100644
              moved[i] = p.up(d).?;
          }
      }
-@@ -14516,3 +14540,134 @@ test "Terminal: insertLines leaves selection above cursor untouched" {
+@@ -14516,3 +14540,175 @@ test "Terminal: insertLines leaves selection above cursor untouched" {
      defer alloc.free(str);
      try testing.expectEqualStrings("AAA", str);
  }
@@ -371,4 +441,45 @@ index 6a7be16..1691747 100644
 +
 +    try t.resize(alloc, 6, 5);
 +    try testing.expect(t.screens.active.latent_selection == null);
++}
++
++test "Terminal: latent selection rescan recovers from unaccounted repaint" {
++    const Selection = @import("Selection.zig");
++    const alloc = testing.allocator;
++    var t = try init(alloc, .{ .rows = 5, .cols = 5 });
++    defer t.deinit(alloc);
++
++    for ("ABCDE", 0..) |c, i| {
++        t.setCursorPos(i + 1, 1);
++        try t.printString(&.{ c, c, c });
++    }
++
++    const screen = t.screens.active;
++    try screen.select(Selection.init(
++        screen.pages.pin(.{ .active = .{ .x = 0, .y = 2 } }).?,
++        screen.pages.pin(.{ .active = .{ .x = 2, .y = 2 } }).?,
++        false,
++    ));
++
++    // Push the selection out: latent now tracks y=5 (off-screen).
++    t.setCursorPos(1, 1);
++    t.insertLines(3);
++    try testing.expect(screen.latent_selection != null);
++
++    // Simulate a multiplexer repainting in place after a jump the IL/DL
++    // ledger never saw: the content reappears at row 1, not where the
++    // ledger expects it. The rescan must find it by content.
++    t.setCursorPos(2, 1);
++    try t.printString("CCC");
++    t.setCursorPos(1, 1);
++
++    const sel = screen.selection orelse return error.TestExpectedRescanRestore;
++    try testing.expect(screen.latent_selection == null);
++    try testing.expectEqual(
++        point.Point{ .active = .{ .x = 0, .y = 1 } },
++        screen.pages.pointFromPin(.active, sel.start()).?,
++    );
++    const str = try screen.selectionString(alloc, .{ .sel = sel });
++    defer alloc.free(str);
++    try testing.expectEqualStrings("CCC", str);
 +}
