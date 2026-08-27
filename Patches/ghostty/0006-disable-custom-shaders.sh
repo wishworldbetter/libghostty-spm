@@ -95,6 +95,29 @@ text = text.replace(
     // Spirv-cross""",
 )
 
+# Ghostty HEAD renamed step.linkLibrary -> step.root_module.linkLibrary;
+# re-run the glslang closer with the new spelling (no-op when absent).
+text = text.replace(
+    """            step.root_module.linkLibrary(glslang_dep.artifact("glslang"));
+            try static_libs.append(
+                b.allocator,
+                glslang_dep.artifact("glslang").getEmittedBin(),
+            );
+        }
+    }
+
+    // Spirv-cross""",
+    """            step.root_module.linkLibrary(glslang_dep.artifact("glslang"));
+            try static_libs.append(
+                b.allocator,
+                glslang_dep.artifact("glslang").getEmittedBin(),
+            );
+        }
+    };
+
+    // Spirv-cross""",
+)
+
 # Gate spirv-cross — wrap with custom_shaders check
 text = text.replace(
     '    // Spirv-cross\n    if (b.lazyDependency("spirv_cross", .{',
@@ -111,6 +134,28 @@ text = text.replace(
 
     // Sentry""",
     """            step.linkLibrary(spirv_cross_dep.artifact("spirv_cross"));
+            try static_libs.append(
+                b.allocator,
+                spirv_cross_dep.artifact("spirv_cross").getEmittedBin(),
+            );
+        }
+    };
+
+    // Sentry""",
+)
+
+# HEAD spelling of the spirv-cross closer.
+text = text.replace(
+    """            step.root_module.linkLibrary(spirv_cross_dep.artifact("spirv_cross"));
+            try static_libs.append(
+                b.allocator,
+                spirv_cross_dep.artifact("spirv_cross").getEmittedBin(),
+            );
+        }
+    }
+
+    // Sentry""",
+    """            step.root_module.linkLibrary(spirv_cross_dep.artifact("spirv_cross"));
             try static_libs.append(
                 b.allocator,
                 spirv_cross_dep.artifact("spirv_cross").getEmittedBin(),
