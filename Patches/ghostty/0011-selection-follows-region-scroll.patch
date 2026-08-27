@@ -1,5 +1,5 @@
 diff --git a/src/terminal/Terminal.zig b/src/terminal/Terminal.zig
-index 0a881a3..592cc3e 100644
+index 0a881a3..395fda8 100644
 --- a/src/terminal/Terminal.zig
 +++ b/src/terminal/Terminal.zig
 @@ -2930,6 +2930,66 @@ fn invalidateFullWidthRowRange(
@@ -91,7 +91,7 @@ index 0a881a3..592cc3e 100644
      // Create a new tracked pin which we'll use to navigate the page list
      // so that if we need to adjust capacity it will be properly tracked.
      var cur_p = self.screens.active.pages.trackPin(
-@@ -16464,3 +16532,183 @@ test "Terminal: eraseDisplay complete ignores stale prompt on recycled row" {
+@@ -16464,3 +16532,189 @@ test "Terminal: eraseDisplay complete ignores stale prompt on recycled row" {
  
      try testing.expectEqual(t.screens.active.pages.rows, t.screens.active.pages.total_rows);
  }
@@ -99,7 +99,8 @@ index 0a881a3..592cc3e 100644
 +test "Terminal: deleteLines translates selection up (in-place region scroll)" {
 +    const Selection = @import("Selection.zig");
 +    const alloc = testing.allocator;
-+    var t = try init(alloc, .{ .rows = 5, .cols = 5 });
++    const io_impl = testing.io;
++    var t = try init(io_impl, alloc, .{ .rows = 5, .cols = 5 });
 +    defer t.deinit(alloc);
 +
 +    try t.printString("AAA");
@@ -133,7 +134,8 @@ index 0a881a3..592cc3e 100644
 +test "Terminal: insertLines translates selection down (in-place region scroll)" {
 +    const Selection = @import("Selection.zig");
 +    const alloc = testing.allocator;
-+    var t = try init(alloc, .{ .rows = 5, .cols = 5 });
++    const io_impl = testing.io;
++    var t = try init(io_impl, alloc, .{ .rows = 5, .cols = 5 });
 +    defer t.deinit(alloc);
 +
 +    try t.printString("AAA");
@@ -164,7 +166,8 @@ index 0a881a3..592cc3e 100644
 +test "Terminal: insertLines translates selection within scroll region" {
 +    const Selection = @import("Selection.zig");
 +    const alloc = testing.allocator;
-+    var t = try init(alloc, .{ .rows = 5, .cols = 5 });
++    const io_impl = testing.io;
++    var t = try init(io_impl, alloc, .{ .rows = 5, .cols = 5 });
 +    defer t.deinit(alloc);
 +
 +    for ("ABCDE", 0..) |c, i| {
@@ -197,7 +200,8 @@ index 0a881a3..592cc3e 100644
 +test "Terminal: insertLines clears selection pushed out of region" {
 +    const Selection = @import("Selection.zig");
 +    const alloc = testing.allocator;
-+    var t = try init(alloc, .{ .rows = 3, .cols = 5 });
++    const io_impl = testing.io;
++    var t = try init(io_impl, alloc, .{ .rows = 3, .cols = 5 });
 +    defer t.deinit(alloc);
 +
 +    try t.printString("AAA");
@@ -224,7 +228,8 @@ index 0a881a3..592cc3e 100644
 +test "Terminal: deleteLines clears selection on deleted rows" {
 +    const Selection = @import("Selection.zig");
 +    const alloc = testing.allocator;
-+    var t = try init(alloc, .{ .rows = 3, .cols = 5 });
++    const io_impl = testing.io;
++    var t = try init(io_impl, alloc, .{ .rows = 3, .cols = 5 });
 +    defer t.deinit(alloc);
 +
 +    try t.printString("AAA");
@@ -248,7 +253,8 @@ index 0a881a3..592cc3e 100644
 +test "Terminal: insertLines leaves selection above cursor untouched" {
 +    const Selection = @import("Selection.zig");
 +    const alloc = testing.allocator;
-+    var t = try init(alloc, .{ .rows = 5, .cols = 5 });
++    const io_impl = testing.io;
++    var t = try init(io_impl, alloc, .{ .rows = 5, .cols = 5 });
 +    defer t.deinit(alloc);
 +
 +    try t.printString("AAA");
