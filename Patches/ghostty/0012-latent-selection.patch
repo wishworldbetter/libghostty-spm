@@ -1,0 +1,374 @@
+diff --git a/src/terminal/Screen.zig b/src/terminal/Screen.zig
+index 95cba1b..7d0fbe0 100644
+--- a/src/terminal/Screen.zig
++++ b/src/terminal/Screen.zig
+@@ -56,6 +56,14 @@ saved_cursor: ?SavedCursor = null,
+ /// automatically setup tracking.
+ selection: ?Selection = null,
+ 
++/// A selection whose content was destroyed by an in-place scroll region
++/// shift (tmux-style DECSTBM + IL/DL repaints). Screens without scrollback
++/// (e.g. the alternate screen) truly lose those rows, so the live selection
++/// is cleared - but its geometry and exact text are kept here so it can be
++/// restored when the same content scrolls back into view. See
++/// Terminal.shiftSelectionForRegionScroll and attemptRestoreLatent.
++latent_selection: ?LatentSelection = null,
++
+ /// The charset state
+ charset: CharsetState = .{},
+ 
+@@ -333,6 +341,7 @@ pub fn deinit(self: *Screen) void {
+     if (comptime build_options.kitty_graphics) {
+         self.kitty_images.deinit(self.alloc, self);
+     }
++    self.dropLatentSelection();
+     self.cursor.deinit(self.alloc);
+     self.pages.deinit();
+ }
+@@ -1839,6 +1848,10 @@ pub inline fn resize(
+ ) !void {
+     defer self.assertIntegrity();
+ 
++    // Latent selection geometry is expressed in the pre-resize grid and
++    // reflow can move content arbitrarily; drop rather than mis-restore.
++    self.dropLatentSelection();
++
+     if (comptime build_options.kitty_graphics) {
+         // No matter what we mark our image state as dirty
+         self.kitty_images.dirty = true;
+@@ -2616,6 +2629,9 @@ pub fn select(self: *Screen, sel_: ?Selection) Allocator.Error!void {
+     if (self.selection) |*old| old.deinit(self);
+     self.selection = tracked_sel;
+     self.dirty.selection = true;
++
++    // A newly made selection supersedes any latent one.
++    self.dropLatentSelection();
+ }
+ 
+ /// Same as select(null) but can't fail.
+@@ -2627,6 +2643,95 @@ pub fn clearSelection(self: *Screen) void {
+     self.selection = null;
+ }
+ 
++/// Free and forget the latent selection, if any.
++pub fn dropLatentSelection(self: *Screen) void {
++    if (self.latent_selection) |lat| self.alloc.free(lat.text);
++    self.latent_selection = null;
++}
++
++/// Demote the live selection to a latent one because rows it covers are
++/// about to be destroyed by an in-place scroll region shift moving the
++/// region content by `delta` rows. Both endpoints must lie on active rows
++/// within [top, bottom]; selections reaching into history or outside the
++/// scroll region move differently from the region content and are cleared
++/// outright. Always clears the live selection.
++pub fn demoteSelectionToLatent(
++    self: *Screen,
++    delta: isize,
++    top: usize,
++    bottom: usize,
++) void {
++    defer self.clearSelection();
++    const sel = if (self.selection) |*v| v else return;
++    const sp = sel.start();
++    const ep = sel.end();
++    const spt = self.pages.pointFromPin(.active, sp) orelse return;
++    const ept = self.pages.pointFromPin(.active, ep) orelse return;
++    const sy: usize = @intCast(spt.coord().y);
++    const ey: usize = @intCast(ept.coord().y);
++    if (sy < top or sy > bottom or ey < top or ey > bottom) return;
++    const text = self.selectionString(self.alloc, .{
++        .sel = sel.*,
++        .trim = false,
++    }) catch return;
++    self.dropLatentSelection();
++    self.latent_selection = .{
++        .start_x = sp.x,
++        .start_y = @as(isize, @intCast(sy)) + delta,
++        .end_x = ep.x,
++        .end_y = @as(isize, @intCast(ey)) + delta,
++        .rectangle = sel.rectangle,
++        .text = text,
++    };
++}
++
++/// Attempt to restore a latent selection: only once both endpoints are
++/// back inside the active area and the content at those coordinates is
++/// byte-identical to the captured text. Cheap no-op when no latent
++/// selection exists, so this is safe to call from hot-ish paths (cursor
++/// addressing) - a tmux-style repaint of the returning rows always ends
++/// with cursor movement, which is what triggers the successful restore.
++pub fn attemptRestoreLatent(self: *Screen) void {
++    const lat = self.latent_selection orelse return;
++
++    // A live (user-made) selection supersedes the latent one.
++    if (self.selection != null) {
++        self.dropLatentSelection();
++        return;
++    }
++
++    const rows: isize = @intCast(self.pages.rows);
++    if (lat.start_y < 0 or lat.start_y >= rows or
++        lat.end_y < 0 or lat.end_y >= rows) return;
++
++    // Bound the total work an unmatchable latent selection can cost.
++    self.latent_selection.?.attempts += 1;
++    if (self.latent_selection.?.attempts > latent_max_attempts) {
++        self.dropLatentSelection();
++        return;
++    }
++
++    const start_pin = self.pages.pin(.{ .active = .{
++        .x = lat.start_x,
++        .y = @intCast(lat.start_y),
++    } }) orelse return;
++    const end_pin = self.pages.pin(.{ .active = .{
++        .x = lat.end_x,
++        .y = @intCast(lat.end_y),
++    } }) orelse return;
++    const sel = Selection.init(start_pin, end_pin, lat.rectangle);
++
++    const text = self.selectionString(self.alloc, .{
++        .sel = sel,
++        .trim = false,
++    }) catch return;
++    defer self.alloc.free(text);
++    if (!std.mem.eql(u8, text, lat.text)) return;
++
++    // The content is back; select() also drops the latent state.
++    self.select(sel) catch return;
++}
++
+ pub const SelectionString = struct {
+     /// The selection to convert to a string.
+     sel: Selection,
+@@ -10944,3 +11049,26 @@ test "Screen: promptClickMove click right of input cursor on last char" {
+     try testing.expectEqual(@as(usize, 1), result.right);
+     try testing.expectEqual(@as(usize, 0), result.left);
+ }
++
++pub const LatentSelection = struct {
++    /// Endpoint coordinates in active-area space. The rows may lie outside
++    /// [0, rows) while the content is scrolled away; they are translated by
++    /// every subsequent region shift.
++    start_x: size.CellCountInt,
++    start_y: isize,
++    end_x: size.CellCountInt,
++    end_y: isize,
++    rectangle: bool,
++    /// Exact text of the original selection (selectionString, untrimmed),
++    /// owned by Screen.alloc. Restoration requires the content at the
++    /// translated coordinates to match byte-for-byte, so stale latent
++    /// state can never highlight the wrong content.
++    text: [:0]const u8,
++    /// In-view restore attempts so far; bounded so a never-matching latent
++    /// selection cannot cost extraction work forever.
++    attempts: usize = 0,
++};
++
++/// Attempts allowed while the latent geometry is fully in view before the
++/// latent selection is dropped as unmatchable.
++const latent_max_attempts = 4096;
+diff --git a/src/terminal/Terminal.zig b/src/terminal/Terminal.zig
+index 6a7be16..1691747 100644
+--- a/src/terminal/Terminal.zig
++++ b/src/terminal/Terminal.zig
+@@ -2092,6 +2092,12 @@ pub fn reverseIndex(self: *Terminal) void {
+ /// greater than the bottom-most row it is adjusted to the bottom-most
+ /// row.
+ pub fn setCursorPos(self: *Terminal, row_req: usize, col_req: usize) void {
++    // A tmux-style repaint of rows returning into view addresses each row
++    // with CUP before printing it and parks the cursor with a final CUP,
++    // so cursor addressing is the natural point to try restoring a latent
++    // selection (no-op when none exists).
++    self.screens.active.attemptRestoreLatent();
++
+     // If cursor origin mode is set the cursor row will be moved relative to
+     // the top margin row and adjusted to be above or at bottom-most row in
+     // the current scroll region.
+@@ -2448,7 +2454,10 @@ fn rowWillBeShifted(
+ /// row content is destroyed by the shift clears the whole selection.
+ fn shiftSelectionForRegionScroll(self: *Terminal, delta: isize) void {
+     const screen = self.screens.active;
+-    const sel = if (screen.selection) |*v| v else return;
++
++    // Give a latent selection its chance first: rows repainted since the
++    // previous shift may have brought its content back into view.
++    screen.attemptRestoreLatent();
+ 
+     const top: usize = screen.cursor.y;
+     const bottom: usize = self.scrolling_region.bottom;
+@@ -2459,6 +2468,19 @@ fn shiftSelectionForRegionScroll(self: *Terminal, delta: isize) void {
+     const left_right = self.scrolling_region.left > 0 or
+         self.scrolling_region.right < self.cols - 1;
+ 
++    // Translate latent geometry along with the content. (A selection
++    // demoted below is created with post-shift coordinates already.)
++    if (screen.latent_selection) |*lat| {
++        if (left_right) {
++            screen.dropLatentSelection();
++        } else {
++            lat.start_y += delta;
++            lat.end_y += delta;
++        }
++    }
++
++    const sel = if (screen.selection) |*v| v else return;
++
+     const pins = [2]*PageList.Pin{ sel.startPtr(), sel.endPtr() };
+     var moved: [2]?PageList.Pin = .{ null, null };
+     for (pins, 0..) |p, i| {
+@@ -2470,13 +2492,15 @@ fn shiftSelectionForRegionScroll(self: *Terminal, delta: isize) void {
+         if (left_right) return screen.clearSelection();
+         if (delta > 0) {
+             const d: usize = @intCast(delta);
+-            // Content originally in the bottom d rows of the range is lost.
+-            if (y + d > bottom) return screen.clearSelection();
++            // Content originally in the bottom d rows of the range is
++            // lost from the grid; keep it as a latent selection so it can
++            // come back when the user scrolls the content into view again.
++            if (y + d > bottom) return screen.demoteSelectionToLatent(delta, top, bottom);
+             moved[i] = p.down(d).?;
+         } else {
+             const d: usize = @intCast(-delta);
+             // Content originally in the top d rows of the range is lost.
+-            if (y < top + d) return screen.clearSelection();
++            if (y < top + d) return screen.demoteSelectionToLatent(delta, top, bottom);
+             moved[i] = p.up(d).?;
+         }
+     }
+@@ -14516,3 +14540,134 @@ test "Terminal: insertLines leaves selection above cursor untouched" {
+     defer alloc.free(str);
+     try testing.expectEqualStrings("AAA", str);
+ }
++
++test "Terminal: latent selection restores after scroll away and back" {
++    const Selection = @import("Selection.zig");
++    const alloc = testing.allocator;
++    var t = try init(alloc, .{ .rows = 5, .cols = 5 });
++    defer t.deinit(alloc);
++
++    for ("ABCDE", 0..) |c, i| {
++        t.setCursorPos(i + 1, 1);
++        try t.printString(&.{ c, c, c });
++    }
++
++    const screen = t.screens.active;
++    try screen.select(Selection.init(
++        screen.pages.pin(.{ .active = .{ .x = 0, .y = 2 } }).?,
++        screen.pages.pin(.{ .active = .{ .x = 2, .y = 2 } }).?,
++        false,
++    ));
++
++    // Scroll region content down by 3: "CCC"'s row is pushed out and
++    // destroyed, so the selection is demoted to latent.
++    t.setCursorPos(1, 1);
++    t.insertLines(3);
++    try testing.expect(screen.selection == null);
++    try testing.expect(screen.latent_selection != null);
++
++    // Scroll back up by 3, then repaint the returning row the way tmux
++    // does: address it with CUP and print the same content.
++    t.deleteLines(3);
++    t.setCursorPos(3, 1);
++    try t.printString("CCC");
++    // The repaint's final cursor movement triggers the restore.
++    t.setCursorPos(1, 1);
++
++    const sel = screen.selection orelse return error.TestExpectedRestore;
++    try testing.expect(screen.latent_selection == null);
++    try testing.expectEqual(
++        point.Point{ .active = .{ .x = 0, .y = 2 } },
++        screen.pages.pointFromPin(.active, sel.start()).?,
++    );
++    const str = try screen.selectionString(alloc, .{ .sel = sel });
++    defer alloc.free(str);
++    try testing.expectEqualStrings("CCC", str);
++}
++
++test "Terminal: latent selection refuses different content" {
++    const Selection = @import("Selection.zig");
++    const alloc = testing.allocator;
++    var t = try init(alloc, .{ .rows = 5, .cols = 5 });
++    defer t.deinit(alloc);
++
++    for ("ABCDE", 0..) |c, i| {
++        t.setCursorPos(i + 1, 1);
++        try t.printString(&.{ c, c, c });
++    }
++
++    const screen = t.screens.active;
++    try screen.select(Selection.init(
++        screen.pages.pin(.{ .active = .{ .x = 0, .y = 2 } }).?,
++        screen.pages.pin(.{ .active = .{ .x = 2, .y = 2 } }).?,
++        false,
++    ));
++
++    t.setCursorPos(1, 1);
++    t.insertLines(3);
++    t.deleteLines(3);
++    // Repaint the returning row with DIFFERENT content.
++    t.setCursorPos(3, 1);
++    try t.printString("XXX");
++    t.setCursorPos(1, 1);
++
++    // No restore onto mismatched text; the latent state stays dormant.
++    try testing.expect(screen.selection == null);
++    try testing.expect(screen.latent_selection != null);
++}
++
++test "Terminal: latent selection dropped by a new selection" {
++    const Selection = @import("Selection.zig");
++    const alloc = testing.allocator;
++    var t = try init(alloc, .{ .rows = 5, .cols = 5 });
++    defer t.deinit(alloc);
++
++    for ("ABCDE", 0..) |c, i| {
++        t.setCursorPos(i + 1, 1);
++        try t.printString(&.{ c, c, c });
++    }
++
++    const screen = t.screens.active;
++    try screen.select(Selection.init(
++        screen.pages.pin(.{ .active = .{ .x = 0, .y = 2 } }).?,
++        screen.pages.pin(.{ .active = .{ .x = 2, .y = 2 } }).?,
++        false,
++    ));
++
++    t.setCursorPos(1, 1);
++    t.insertLines(3);
++    try testing.expect(screen.latent_selection != null);
++
++    try screen.select(Selection.init(
++        screen.pages.pin(.{ .active = .{ .x = 0, .y = 3 } }).?,
++        screen.pages.pin(.{ .active = .{ .x = 2, .y = 3 } }).?,
++        false,
++    ));
++    try testing.expect(screen.latent_selection == null);
++}
++
++test "Terminal: latent selection dropped on resize" {
++    const Selection = @import("Selection.zig");
++    const alloc = testing.allocator;
++    var t = try init(alloc, .{ .rows = 5, .cols = 5 });
++    defer t.deinit(alloc);
++
++    for ("ABCDE", 0..) |c, i| {
++        t.setCursorPos(i + 1, 1);
++        try t.printString(&.{ c, c, c });
++    }
++
++    const screen = t.screens.active;
++    try screen.select(Selection.init(
++        screen.pages.pin(.{ .active = .{ .x = 0, .y = 2 } }).?,
++        screen.pages.pin(.{ .active = .{ .x = 2, .y = 2 } }).?,
++        false,
++    ));
++
++    t.setCursorPos(1, 1);
++    t.insertLines(3);
++    try testing.expect(screen.latent_selection != null);
++
++    try t.resize(alloc, 6, 5);
++    try testing.expect(t.screens.active.latent_selection == null);
++}
