@@ -11,6 +11,17 @@
 
     @MainActor
     open class AppTerminalView: NSView {
+        /// Wrapper-level renderer-target compaction for hidden surfaces.
+        /// Ghostty cores newer than 2026-08-25 release GPU resources
+        /// natively while occluded (renderer/generic.zig), so the wrapper
+        /// must keep its hands off the swap chain there: two owners of the
+        /// same targets risk stale metrics and first-frame artifacts. Set
+        /// GHOSTTY_SPM_COMPACTION=0 to disable compaction and let the core
+        /// manage hidden-surface memory; occlusion reporting, display-link
+        /// pausing, and wakeup processing are unaffected either way.
+        public static let rendererCompactionEnabled =
+            ProcessInfo.processInfo.environment["GHOSTTY_SPM_COMPACTION"] != "0"
+
         let core = TerminalSurfaceCoordinator()
         var metalLayer: CAMetalLayer?
         var inputHandler: TerminalKeyEventHandler?
@@ -119,9 +130,11 @@
                 self?.applyMouseShape(shape)
             }
             core.onRenderSuspended = { [weak self] in
+                guard Self.rendererCompactionEnabled else { return }
                 self?.compactRendererTargets()
             }
             core.onRenderResuming = { [weak self] in
+                guard Self.rendererCompactionEnabled else { return }
                 self?.restoreRendererTargets()
             }
         }
