@@ -8,7 +8,7 @@ index 6ab2e8b..e0ea096 100644
  src/terminal/res/** linguist-vendored
 +src/terminal/res/tmux_wheel_*.raw binary
 diff --git a/src/terminal/Screen.zig b/src/terminal/Screen.zig
-index 95cba1b..eca904e 100644
+index 95cba1b..2188464 100644
 --- a/src/terminal/Screen.zig
 +++ b/src/terminal/Screen.zig
 @@ -56,6 +56,14 @@ saved_cursor: ?SavedCursor = null,
@@ -55,7 +55,7 @@ index 95cba1b..eca904e 100644
  }
  
  /// Same as select(null) but can't fail.
-@@ -2625,6 +2641,279 @@ pub fn clearSelection(self: *Screen) void {
+@@ -2625,6 +2641,320 @@ pub fn clearSelection(self: *Screen) void {
          self.dirty.selection = true;
      }
      self.selection = null;
@@ -65,6 +65,16 @@ index 95cba1b..eca904e 100644
 +    // spontaneously reappear later. (Internal demotion flips the record
 +    // to a real latent *before* clearing, so it survives this.)
 +    if (self.latent_selection) |lat| if (lat.shadow) self.dropLatentSelection();
++}
++
++/// Rows are being rewritten in place (EL/ED). In-place rewrites can move
++/// content in ways the IL/DL ledger cannot see (tmux full repaints erase
++/// each row they paint), so after one, a latent record's coordinates can
++/// no longer rule out off-screen content having returned; content
++/// rescans take over from the held-off coordinate ledger. Near-zero cost
++/// when no latent state exists.
++pub fn latentNoteInPlaceRewrite(self: *Screen) void {
++    if (self.latent_selection) |*lat| lat.ledger_broken = true;
 +}
 +
 +/// Free and forget the latent selection, if any.
@@ -219,8 +229,11 @@ index 95cba1b..eca904e 100644
 +            return;
 +        };
 +
-+        // If the frame left the selected content in place (or the v1
-+        // pin translation followed it), the shadow served its purpose.
++        // Sticky rule: while the content under the live selection is
++        // still byte-identical to the snapshot, settling NEVER moves
++        // it - even if identical text also exists elsewhere on screen
++        // (two `ll` runs of the same directory). Staying put is the
++        // only correct adjudication for duplicated content.
 +        const cur = self.selectionString(self.alloc, .{
 +            .sel = sel.*,
 +            .trim = false,
@@ -234,42 +247,63 @@ index 95cba1b..eca904e 100644
 +        // The frame moved content out from under the live selection.
 +        // If the exact text is elsewhere in the viewport, re-anchor the
 +        // highlight to it (latentRescan restores via select(), which
-+        // replaces the live selection and retires the record). If it is
-+        // not in view - scrolled beyond the screen, or overwritten for
-+        // good - keep the live selection as upstream would, and keep
-+        // the shadow: the text may scroll back later. The scan cap
-+        // below garbage-collects a shadow that never matches again.
++        // replaces the live selection and retires the record). The
++        // candidate nearest the CURRENT pin position wins: the highlight
++        // moves as little as possible, which keeps it tracking its own
++        // copy when byte-identical copies exist. If the text is not in
++        // view - scrolled beyond the screen, or overwritten for good -
++        // keep the live selection as upstream would, and keep the
++        // shadow: the text may scroll back later. The pins are no
++        // longer known to be glued to the content though, so the
++        // geometry is marked broken. The scan cap garbage-collects a
++        // shadow that never matches again.
++        const origin: isize = origin: {
++            const spt = self.pages.pointFromPin(.active, sel.start()) orelse
++                break :origin lat.start_y;
++            break :origin @intCast(spt.coord().y);
++        };
 +        self.latent_selection.?.shadow = false;
-+        if (self.latentRescan()) return;
++        if (self.latentRescan(origin)) return;
 +        self.latent_selection.?.shadow = true;
++        self.latent_selection.?.ledger_broken = true;
 +        self.latent_selection.?.scans += 1;
 +        if (self.latent_selection.?.scans > latent_max_scans)
 +            self.dropLatentSelection();
 +        return;
 +    }
 +
-+    // No live selection: coordinate attempt first (the IL/DL ledger is
-+    // exact when tmux scrolls incrementally), then a full content
-+    // rescan - the ledger cannot see motion performed via in-place
-+    // repaints, but the content itself is ground truth. One rescan per
-+    // completed frame is bounded work; the cap doubles as garbage
-+    // collection for a latent selection that never matches again.
++    // No live selection: coordinate attempt first - the IL/DL ledger is
++    // exact when tmux scrolls incrementally, and with byte-identical
++    // copies on screen it is the only provenance we have.
++    const rows: isize = @intCast(self.pages.rows);
++    const in_view = lat.start_y >= 0 and lat.start_y < rows and
++        lat.end_y >= 0 and lat.end_y < rows;
++    if (in_view and self.latentTextMatchesAt(lat, lat.start_y, lat.end_y)) {
++        _ = self.restoreLatentAt(lat.start_y, lat.end_y);
++        return;
++    }
++
++    // While the ledger is still traced (every motion since demotion was
++    // IL/DL-translated) and it says the content is out of view, believe
++    // it: the content has not arrived yet, and a content rescan now
++    // could only ever grab a byte-identical copy that happens to be
++    // visible - the exact "highlight jumps to the other `ll` output"
++    // failure. Hold until the ledger position scrolls in, or until an
++    // in-place rewrite breaks the trace. Held frames cost nothing and
++    // are not charged against any budget.
++    if (!in_view and !lat.ledger_broken) return;
++
++    // Ledger wrong (in view but mismatched) or broken: content is the
++    // only ground truth left; rescan, nearest to the ledger coordinate.
++    // One rescan per completed frame is bounded work; the cap doubles as
++    // garbage collection for a latent selection that never matches
++    // again.
 +    self.latent_selection.?.scans += 1;
 +    if (self.latent_selection.?.scans > latent_max_scans) {
 +        self.dropLatentSelection();
 +        return;
 +    }
-+
-+    const rows: isize = @intCast(self.pages.rows);
-+    if (lat.start_y >= 0 and lat.start_y < rows and
-+        lat.end_y >= 0 and lat.end_y < rows)
-+    {
-+        if (self.latentTextMatchesAt(lat, lat.start_y, lat.end_y)) {
-+            _ = self.restoreLatentAt(lat.start_y, lat.end_y);
-+            return;
-+        }
-+    }
-+    _ = self.latentRescan();
++    _ = self.latentRescan(lat.start_y);
 +}
 +
 +/// True if the latent selection's text appears exactly at the given
@@ -310,9 +344,16 @@ index 95cba1b..eca904e 100644
 +}
 +
 +/// Scan every vertical placement of the latent geometry that fits in the
-+/// viewport for an exact text match; the placement nearest the tracked
-+/// position wins. Returns true when a restore happened.
-+fn latentRescan(self: *Screen) bool {
++/// viewport for an exact text match; the placement nearest `origin_y`
++/// wins. The origin is the current pin position when re-anchoring a live
++/// selection (minimize how far the highlight moves - with byte-identical
++/// copies on screen this is what keeps it tracking its own copy) and the
++/// ledger coordinate when reviving a demoted one. Distance ties resolve
++/// deterministically to the topmost placement (the scan ascends and only
++/// a strictly closer candidate replaces the current best), so repeated
++/// scans of an unchanged screen can never alternate between two equally
++/// distant copies. Returns true when a restore happened.
++fn latentRescan(self: *Screen, origin_y: isize) bool {
 +    const lat = self.latent_selection orelse return false;
 +    const rows: isize = @intCast(self.pages.rows);
 +    const dy = lat.end_y - lat.start_y;
@@ -326,7 +367,7 @@ index 95cba1b..eca904e 100644
 +        const ey = sy + dy;
 +        if (self.latentTextMatchesAt(lat, sy, ey)) {
 +            if (best) |b| {
-+                if (@abs(sy - lat.start_y) < @abs(b - lat.start_y)) best = sy;
++                if (@abs(sy - origin_y) < @abs(b - origin_y)) best = sy;
 +            } else best = sy;
 +        }
 +    }
@@ -335,7 +376,7 @@ index 95cba1b..eca904e 100644
  }
  
  pub const SelectionString = struct {
-@@ -8848,8 +9137,11 @@ test "Screen: selectWord" {
+@@ -8848,8 +9178,11 @@ test "Screen: selectWord" {
  
      // Default boundary codepoints for word selection
      const boundary_codepoints = &[_]u21{
@@ -349,7 +390,7 @@ index 95cba1b..eca904e 100644
      };
  
      // Outside of active area
-@@ -8969,8 +9261,11 @@ test "Screen: selectWord across soft-wrap" {
+@@ -8969,8 +9302,11 @@ test "Screen: selectWord across soft-wrap" {
  
      // Default boundary codepoints for word selection
      const boundary_codepoints = &[_]u21{
@@ -363,7 +404,7 @@ index 95cba1b..eca904e 100644
      };
  
      {
-@@ -9041,8 +9336,11 @@ test "Screen: selectWord whitespace across soft-wrap" {
+@@ -9041,8 +9377,11 @@ test "Screen: selectWord whitespace across soft-wrap" {
  
      // Default boundary codepoints for word selection
      const boundary_codepoints = &[_]u21{
@@ -377,7 +418,7 @@ index 95cba1b..eca904e 100644
      };
  
      // Going forward
-@@ -9103,8 +9401,11 @@ test "Screen: selectWord with character boundary" {
+@@ -9103,8 +9442,11 @@ test "Screen: selectWord with character boundary" {
  
      // Default boundary codepoints for word selection
      const boundary_codepoints = &[_]u21{
@@ -391,7 +432,7 @@ index 95cba1b..eca904e 100644
      };
  
      const cases = [_][]const u8{
-@@ -10944,3 +11245,47 @@ test "Screen: promptClickMove click right of input cursor on last char" {
+@@ -10944,3 +11286,57 @@ test "Screen: promptClickMove click right of input cursor on last char" {
      try testing.expectEqual(@as(usize, 1), result.right);
      try testing.expectEqual(@as(usize, 0), result.left);
  }
@@ -431,6 +472,16 @@ index 95cba1b..eca904e 100644
 +    /// matches, used to re-anchor when the content moved within view,
 +    /// promoted to a real latent record on demotion.
 +    shadow: bool = false,
++    /// True once the geometry can no longer be trusted to rule out the
++    /// content being elsewhere: an in-place row rewrite (EL/ED) happened
++    /// while this record existed, or a paint frame moved the mirrored
++    /// live selection somewhere the shadow could not follow. While the
++    /// ledger is still traced (false), an out-of-view coordinate means
++    /// "the content has not arrived yet" and content rescans are held
++    /// off - this is what keeps a restore from grabbing a byte-identical
++    /// copy of the selection (two `ll` runs of the same directory) that
++    /// scrolls into view before the original does.
++    ledger_broken: bool = false,
 +};
 +
 +/// Attempts allowed while the latent geometry is fully in view before the
@@ -440,7 +491,7 @@ index 95cba1b..eca904e 100644
 +/// Viewport content rescans allowed before the latent selection is dropped.
 +const latent_max_scans = 512;
 diff --git a/src/terminal/Terminal.zig b/src/terminal/Terminal.zig
-index 6a7be16..a083885 100644
+index 6a7be16..84faa75 100644
 --- a/src/terminal/Terminal.zig
 +++ b/src/terminal/Terminal.zig
 @@ -2092,6 +2092,12 @@ pub fn reverseIndex(self: *Terminal) void {
@@ -531,7 +582,29 @@ index 6a7be16..a083885 100644
  /// Insert amount lines at the current cursor row. The contents of the line
  /// at the current cursor row and below (to the bottom-most line in the
  /// scrolling region) are shifted down by amount lines. The contents of the
-@@ -12489,11 +12530,12 @@ fn testPrintSliceDifferential(
+@@ -3102,6 +3143,10 @@ pub fn eraseLine(
+     mode: csi.EraseLine,
+     protected_req: bool,
+ ) void {
++    // In-place row rewrite: the latent selection ledger can no longer
++    // rule out unseen content motion (no-op when no latent state).
++    self.screens.active.latentNoteInPlaceRewrite();
++
+     // Get our start/end positions depending on mode.
+     const start, const end = switch (mode) {
+         .right => right: {
+@@ -3182,6 +3227,10 @@ pub fn eraseDisplay(
+     mode: csi.EraseDisplay,
+     protected_req: bool,
+ ) void {
++    // In-place rewrite: the latent selection ledger can no longer rule
++    // out unseen content motion (no-op when no latent state).
++    self.screens.active.latentNoteInPlaceRewrite();
++
+     // We respect protected attributes if explicitly requested (probably
+     // a DECSEL sequence) or if our last protected mode was ISO even if its
+     // not currently set.
+@@ -12489,11 +12538,12 @@ fn testPrintSliceDifferential(
      // Alphabet of interesting codepoints: ascii, latin-1, combining
      // marks, CJK (wide), emoji (wide), ZWJ, variation selectors.
      const alphabet = [_]u21{
@@ -549,7 +622,7 @@ index 6a7be16..a083885 100644
      };
  
      var cps_buf: [64]u32 = undefined;
-@@ -14516,3 +14558,382 @@ test "Terminal: insertLines leaves selection above cursor untouched" {
+@@ -14516,3 +14566,509 @@ test "Terminal: insertLines leaves selection above cursor untouched" {
      defer alloc.free(str);
      try testing.expectEqualStrings("AAA", str);
  }
@@ -710,10 +783,13 @@ index 6a7be16..a083885 100644
 +
 +    // Simulate a multiplexer repainting in place after a jump the IL/DL
 +    // ledger never saw: the content reappears at row 1, not where the
-+    // ledger expects it. The rescan runs at frame completion (DECSET 25)
-+    // and must find it by content.
++    // ledger expects it. Real repaints erase each painted row to EOL
++    // (that EL is also what marks the ledger broken and unlocks the
++    // content rescan); the rescan runs at frame completion (DECSET 25)
++    // and must find the content wherever it landed.
 +    t.setCursorPos(2, 1);
 +    try t.printString("CCC");
++    t.eraseLine(.right, false);
 +    t.cursorVisibilityChanged(true);
 +
 +    const sel = screen.selection orelse return error.TestExpectedRescanRestore;
@@ -932,6 +1008,169 @@ index 6a7be16..a083885 100644
 +    screen.clearSelection();
 +    try testing.expect(screen.latent_selection == null);
 +}
++
++test "Terminal: latent shadow re-anchor follows its own copy among identical blocks" {
++    const Selection = @import("Selection.zig");
++    const alloc = testing.allocator;
++    var t = try init(alloc, .{ .rows = 12, .cols = 6 });
++    defer t.deinit(alloc);
++
++    // Two byte-identical "AAA"/"BBB" blocks (rows 3-4 and rows 9-10),
++    // unique rows elsewhere - the `ll`-twice shape.
++    const P = struct {
++        const content = [_][]const u8{
++            "R00", "R01", "R02", "AAA", "BBB", "R05", "R06",
++            "R07", "R08", "AAA", "BBB", "R11", "R12", "R13",
++        };
++        fn paint(term: *Terminal, offset: usize) !void {
++            for (0..12) |r| {
++                term.setCursorPos(r + 1, 1);
++                try term.printString(content[r + offset]);
++            }
++        }
++    };
++    try P.paint(&t, 0);
++
++    // Select the SECOND copy's "AAA" (row 9).
++    const screen = t.screens.active;
++    try screen.select(Selection.init(
++        screen.pages.pin(.{ .active = .{ .x = 0, .y = 9 } }).?,
++        screen.pages.pin(.{ .active = .{ .x = 2, .y = 9 } }).?,
++        false,
++    ));
++
++    const rowOf = struct {
++        fn f(scr: *Screen) !u32 {
++            const sel = scr.selection orelse return error.NoSelection;
++            const pt = scr.pages.pointFromPin(.active, sel.start()) orelse
++                return error.NotActive;
++            return pt.coord().y;
++        }
++    }.f;
++
++    // Frame 1: in-place repaint scrolls everything up by one. The
++    // second copy's "AAA" moves 9 -> 8; the first copy's identical
++    // "AAA" sits at row 2. Re-anchoring must take the candidate nearest
++    // the current pins - follow its own copy, never jump blocks.
++    t.cursorVisibilityChanged(false);
++    try P.paint(&t, 1);
++    t.cursorVisibilityChanged(true);
++    try testing.expectEqual(@as(u32, 8), try rowOf(screen));
++
++    // Frame 2: one more row up: 8 -> 7 (first copy now at row 1).
++    t.cursorVisibilityChanged(false);
++    try P.paint(&t, 2);
++    t.cursorVisibilityChanged(true);
++    try testing.expectEqual(@as(u32, 7), try rowOf(screen));
++
++    // Frame 3: no motion - repaint the identical content. The sticky
++    // rule: a still-matching selection is NEVER moved, even though a
++    // byte-identical copy exists elsewhere on screen.
++    t.cursorVisibilityChanged(false);
++    try P.paint(&t, 2);
++    t.cursorVisibilityChanged(true);
++    try testing.expectEqual(@as(u32, 7), try rowOf(screen));
++}
++
++test "Terminal: latent traced ledger holds until its own copy returns" {
++    const Selection = @import("Selection.zig");
++    const alloc = testing.allocator;
++    var t = try init(alloc, .{ .rows = 12, .cols = 6 });
++    defer t.deinit(alloc);
++
++    const content = [_][]const u8{
++        "R00", "R01", "R02", "AAA", "BBB", "R05",
++        "R06", "R07", "R08", "AAA", "BBB", "R11",
++    };
++    for (content, 0..) |text, r| {
++        t.setCursorPos(r + 1, 1);
++        try t.printString(text);
++    }
++
++    // Select the SECOND copy's "AAA" (row 9).
++    const screen = t.screens.active;
++    try screen.select(Selection.init(
++        screen.pages.pin(.{ .active = .{ .x = 0, .y = 9 } }).?,
++        screen.pages.pin(.{ .active = .{ .x = 2, .y = 9 } }).?,
++        false,
++    ));
++
++    // Scroll region content down by 6: the selected row is destroyed
++    // (demoted, ledger y = 15, exactly traced). The FIRST copy's
++    // identical "AAA" is now visible at row 9 - the very slot the
++    // selection used to occupy.
++    t.setCursorPos(1, 1);
++    t.insertLines(6);
++    try testing.expect(screen.selection == null);
++    try testing.expect(screen.latent_selection != null);
++
++    // Frame completes. The ledger is traced and says the content is
++    // still out of view; the byte-identical first copy on screen must
++    // NOT be grabbed - this is the "highlight jumps to the other ll
++    // output" failure when it is.
++    t.cursorVisibilityChanged(true);
++    try testing.expect(screen.selection == null);
++    try testing.expect(screen.latent_selection != null);
++
++    // Scroll back and repaint the returning rows; the ledger (y = 9)
++    // now points at the original copy, and the exact coordinate match
++    // restores there - even though the first copy (row 3) is equally
++    // identical and also visible.
++    t.deleteLines(6);
++    for (6..12) |r| {
++        t.setCursorPos(r + 1, 1);
++        try t.printString(content[r]);
++    }
++    t.cursorVisibilityChanged(true);
++
++    const sel = screen.selection orelse return error.TestExpectedRestore;
++    try testing.expect(screen.latent_selection == null);
++    const pt = screen.pages.pointFromPin(.active, sel.start()) orelse
++        return error.TestExpectedActivePin;
++    try testing.expectEqual(@as(u32, 9), pt.coord().y);
++    const str = try screen.selectionString(alloc, .{ .sel = sel });
++    defer alloc.free(str);
++    try testing.expectEqualStrings("AAA", str);
++}
+diff --git a/src/terminal/res/tmux_wheel_dup_attach.raw b/src/terminal/res/tmux_wheel_dup_attach.raw
+new file mode 100644
+index 0000000000000000000000000000000000000000..6bce985af72aa9069a57e9c1c9b2b4ffafb0c787
+GIT binary patch
+literal 1849
+zcmeHHy>7xV5FU|`cmgksT};l-A8FJgRaHe>hAvDlgK-=MDIsZM5D!!J;rb-CLn_ms
+zjSi?{u<!d$=TGOm(;+q?;6)i?l*SN)LfVm`E5xSS^<Wsy^-X;pqC)`;)3)_$>vlZo
+ztlvfhcqX2LtHszPih?z|xIwHikG~3jKKxCX#6+h-V(Qh13B<0=c|i*T@dQ0<OIpjQ
+z7ZZPq77(vjB_5CRQt-To7Ga#Oa(U@E2X3dTS6i;6ql(HAIo~7_`#>B#Z)DxzM)4Zg
+zvMO=GMcLp)ZgC@JQfzj3&DClv9S~f&9xU-vrYZJl!f}))6q7Jb+#r?UM!wUCnk$i2
+zJn5N2n6gao?q@ShqA_BRgMLRMODKRQh`Cgki4=qW``hbqsCiIWwS5_ff~#TsgQnOe
+zn`)$Xx^r6fcK(EcSV%2&E%Yq(EetFSE!=0@>Y7~tMSAT&4hNBpb@_;=jvmr|r_J1+
+jn|&g)_@mioeYNW;3~87h-}1ke>vq|BXPnqd`!+@&H{9P^
+
+literal 0
+HcmV?d00001
+
+diff --git a/src/terminal/res/tmux_wheel_dup_scroll.raw b/src/terminal/res/tmux_wheel_dup_scroll.raw
+new file mode 100644
+index 0000000000000000000000000000000000000000..ac7aea7d7f0174e363b33c9823926714f965b6af
+GIT binary patch
+literal 3984
+zcmeH~zi!(w5XN@{dIBvTyQHzi|Hu%aEs7L%fi9gi8TOE&0*pol@-Rgou20ev$*ZX2
+zhrr3yA%l(MXOiacyAw&Z!)<TAx5M4XPy78<7fd^RZZ^4L%Z4i(zHEf0(eHNDXb07g
+z?a+<Q=Fjh6+by;2_;CDjn2z`7!>N7qt{ukh@i1+#r}2FKFg~7sp5IQ7Q=I6-x35>b
+zZVCG(R7<FrFs(TbODm3HT5k-~YGXLB^}ktOJKT0XnNKOWkKc1#D0k%Ho<27nr-!I(
+zkzA=oa;?`lj($i9etKTAyPkqlS&5zutVJ@I{;Z=Pa^flNDa)ugWu~5jGFOX~*;+&%
+zc;ta659;9v)gx4gP~Edo9YS>o)ge@eP#r>b2-P7}hfpm-wS-#PXAzM_L>3WQL}U?>
+zjRkzVsC+E~wFuN8P=i1X0yPNKAW(xq4FWYNbp{a`M5GasMnoDBX+)$Ekw!!s5otuE
+z5s^kj3K1zpq!5upL<$ipM5GXrdb$|D<n1pVn_MJ9&1)4ZVd4E*^vj;CRW5O%lGB&W
+zIX_|Z^DRbaexYWogqmFyYEFPqAwTaiqA#T7oon5fH#wm~Hr_f#U&zKAvgixhc$*h}
+zbIA%7vhe}5?(6e2BUH%7C!pvH**wgfhio3^%|kX1*+PEE*DDJbR%w8=0aj^%wDX;|
+zuJZtC1EdX*HXzz~0WSZoyb?X*Cft<c%BvK+7;m%WVXwr!s}Xmv)c|2;oJ3d|HDP4b
+zgpE-XCPqzI7&T#F)P#K{@T*bzM0u%E>+%^o^`2`eoecawL3vqT_b4IUczus+Hqm=}
+h5Xh4lQvGvCWzQj1JBP_kPT7U8nKYb^>whnOe*w96+eiQa
+
+literal 0
+HcmV?d00001
+
 diff --git a/src/terminal/res/tmux_wheel_flick_attach.raw b/src/terminal/res/tmux_wheel_flick_attach.raw
 new file mode 100644
 index 0000000000000000000000000000000000000000..25f165b0cb4a1cad90b82fda2d700f6b8dbf0bf8
@@ -1053,7 +1292,7 @@ literal 0
 HcmV?d00001
 
 diff --git a/src/terminal/stream_terminal.zig b/src/terminal/stream_terminal.zig
-index c635e91..c5a5728 100644
+index c635e91..f0bade3 100644
 --- a/src/terminal/stream_terminal.zig
 +++ b/src/terminal/stream_terminal.zig
 @@ -533,6 +533,11 @@ pub const Handler = struct {
@@ -1068,7 +1307,7 @@ index c635e91..c5a5728 100644
              .enable_left_and_right_margin => if (!enabled) {
                  self.terminal.scrolling_region.left = 0;
                  self.terminal.scrolling_region.right = self.terminal.cols - 1;
-@@ -2423,3 +2428,97 @@ test "kitty graphics via APC" {
+@@ -2423,3 +2428,151 @@ test "kitty graphics via APC" {
      const img = storage.imageById(1).?;
      try testing.expectEqual(.rgb, img.format);
  }
@@ -1165,6 +1404,60 @@ index c635e91..c5a5728 100644
 +    });
 +    defer alloc.free(after);
 +    try testing.expectEqualStrings("LINE-490", after);
++}
++
++test "Terminal: latent selection sticks to its copy among identical blocks" {
++    // Real capture: the pane shows two byte-identical 9-row blocks (two
++    // `cat` runs of the same file, identical prompt/command lines between
++    // them - the `ll`-twice scenario), 10 rows apart. The user selects
++    // "DUP-05" in the SECOND block (row 18; the first block's identical
++    // copy sits on row 8), wheels out ~66 lines and back with the exact
++    // Seedmux commands, slow-paced.
++    //
++    // On the way back the FIRST block's copy scrolls into view before the
++    // second one. The highlight must NOT revive on it: it must come back
++    // on the original copy, at the original row.
++    const Selection = @import("Selection.zig");
++    const alloc = testing.allocator;
++    var t: Terminal = try .init(alloc, .{ .cols = 80, .rows = 24 });
++    defer t.deinit(alloc);
++
++    var s: Stream = .initAlloc(alloc, .init(&t));
++    defer s.deinit();
++
++    s.nextSlice(@embedFile("res/tmux_wheel_dup_attach.raw"));
++
++    const screen = t.screens.active;
++    try screen.select(Selection.init(
++        screen.pages.pin(.{ .active = .{ .x = 0, .y = 18 } }).?,
++        screen.pages.pin(.{ .active = .{ .x = 5, .y = 18 } }).?,
++        false,
++    ));
++    {
++        const before = try screen.selectionString(alloc, .{
++            .sel = screen.selection.?,
++            .trim = false,
++        });
++        defer alloc.free(before);
++        try testing.expectEqualStrings("DUP-05", before);
++    }
++
++    s.nextSlice(@embedFile("res/tmux_wheel_dup_scroll.raw"));
++
++    const sel = screen.selection orelse return error.TestExpectedRestore;
++    const after = try screen.selectionString(alloc, .{
++        .sel = sel,
++        .trim = false,
++    });
++    defer alloc.free(after);
++    try testing.expectEqualStrings("DUP-05", after);
++
++    // The decisive assertion: the ORIGINAL copy (row 18), not the first
++    // block's identical copy on row 8.
++    const pt = screen.pages.pointFromPin(.active, sel.start()) orelse
++        return error.TestExpectedActivePin;
++    try testing.expectEqual(@as(u32, 18), pt.coord().y);
++    try testing.expect(pt.coord().x == 0);
 +}
 diff --git a/src/termio/stream_handler.zig b/src/termio/stream_handler.zig
 index 43c5d61..83ae6e0 100644
