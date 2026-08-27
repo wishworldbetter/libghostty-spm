@@ -45,6 +45,41 @@
             surface?.hasSelection() ?? false
         }
 
+        /// The selection's endpoints in active-area grid coordinates,
+        /// visually ordered (top-left is the earlier endpoint regardless
+        /// of drag direction). Nil without a selection or when an
+        /// endpoint sits outside the active area.
+        public var selectionRegion: (tlX: Int, tlY: Int, brX: Int, brY: Int, rectangle: Bool)? {
+            guard let region = surface?.selectionRegion() else { return nil }
+            return (region.tlX, region.tlY, region.brX, region.brY, region.rectangle)
+        }
+
+        /// Programmatically set the selection to a grid region. Unlike
+        /// mouse selection this never triggers copy-on-select and never
+        /// writes any clipboard.
+        @discardableResult
+        public func setSelectionRegion(
+            tlX: Int,
+            tlY: Int,
+            brX: Int,
+            brY: Int,
+            rectangle: Bool = false
+        ) -> Bool {
+            surface?.setSelectionRegion(.init(
+                tlX: tlX,
+                tlY: tlY,
+                brX: brX,
+                brY: brY,
+                rectangle: rectangle
+            )) ?? false
+        }
+
+        /// Programmatically clear any selection, with no clipboard side
+        /// effects.
+        public func clearSelection() {
+            surface?.clearSelection()
+        }
+
         /// Search the screen and scrollback for `needle`, replacing any active
         /// search. An empty needle cancels without dismissing host search UI.
         @discardableResult

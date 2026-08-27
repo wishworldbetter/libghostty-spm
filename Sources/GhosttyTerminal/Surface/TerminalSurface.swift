@@ -314,6 +314,75 @@ public final class TerminalSurface {
         )
     }
 
+    /// Selection endpoints in active-area grid coordinates, visually
+    /// ordered: (tlX, tlY) is the earlier endpoint regardless of drag
+    /// direction.
+    struct SelectionRegion {
+        var tlX: Int
+        var tlY: Int
+        var brX: Int
+        var brY: Int
+        var rectangle: Bool
+    }
+
+    func selectionRegion() -> SelectionRegion? {
+        guard let s = surface else {
+            TerminalDebugLog.log(.input, "surface selectionRegion ignored: missing surface")
+            return nil
+        }
+        var out = ghostty_selection_s()
+        guard ghostty_surface_selection_info(s, &out) else { return nil }
+        let region = SelectionRegion(
+            tlX: Int(out.tl.x),
+            tlY: Int(out.tl.y),
+            brX: Int(out.br.x),
+            brY: Int(out.br.y),
+            rectangle: out.rectangle
+        )
+        TerminalDebugLog.log(
+            .input,
+            "surface selectionRegion tl=(\(region.tlX),\(region.tlY)) br=(\(region.brX),\(region.brY)) rect=\(region.rectangle)"
+        )
+        return region
+    }
+
+    /// Programmatic selection: never triggers copy-on-select and never
+    /// writes any clipboard.
+    @discardableResult
+    func setSelectionRegion(_ region: SelectionRegion) -> Bool {
+        guard let s = surface else {
+            TerminalDebugLog.log(.input, "surface setSelectionRegion ignored: missing surface")
+            return false
+        }
+        var sel = ghostty_selection_s()
+        sel.tl = ghostty_point_s(
+            tag: GHOSTTY_POINT_ACTIVE,
+            coord: GHOSTTY_POINT_COORD_EXACT,
+            x: UInt32(clamping: region.tlX),
+            y: UInt32(clamping: region.tlY)
+        )
+        sel.br = ghostty_point_s(
+            tag: GHOSTTY_POINT_ACTIVE,
+            coord: GHOSTTY_POINT_COORD_EXACT,
+            x: UInt32(clamping: region.brX),
+            y: UInt32(clamping: region.brY)
+        )
+        sel.rectangle = region.rectangle
+        let ok = ghostty_surface_set_selection(s, sel)
+        TerminalDebugLog.log(
+            .input,
+            "surface setSelectionRegion tl=(\(region.tlX),\(region.tlY)) br=(\(region.brX),\(region.brY)) ok=\(ok)"
+        )
+        return ok
+    }
+
+    /// Clear any selection without clipboard side effects.
+    func clearSelection() {
+        guard let s = surface else { return }
+        ghostty_surface_clear_selection(s)
+        TerminalDebugLog.log(.input, "surface clearSelection")
+    }
+
     // MARK: - IME
 
     func imePoint() -> (x: Double, y: Double, width: Double, height: Double) {

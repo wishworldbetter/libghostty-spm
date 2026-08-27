@@ -1,0 +1,1097 @@
+diff --git a/.gitattributes b/.gitattributes
+index 6ab2e8b..e0ea096 100644
+--- a/.gitattributes
++++ b/.gitattributes
+@@ -56,3 +56,4 @@ src/font/nerd_font_attributes.zig linguist-generated=true
+ src/font/nerd_font_codepoint_tables.py linguist-generated=true
+ src/font/res/** linguist-vendored
+ src/terminal/res/** linguist-vendored
++src/terminal/res/tmux_wheel_*.raw binary
+diff --git a/include/ghostty.h b/include/ghostty.h
+index 72bbb57..21c0345 100644
+--- a/include/ghostty.h
++++ b/include/ghostty.h
+@@ -1161,6 +1161,11 @@ GHOSTTY_API bool ghostty_surface_read_selection(ghostty_surface_t, ghostty_text_
+ GHOSTTY_API bool ghostty_surface_read_text(ghostty_surface_t,
+                                               ghostty_selection_s,
+                                               ghostty_text_s*);
++GHOSTTY_API bool ghostty_surface_selection_info(ghostty_surface_t,
++                                                ghostty_selection_s*);
++GHOSTTY_API bool ghostty_surface_set_selection(ghostty_surface_t,
++                                               ghostty_selection_s);
++GHOSTTY_API void ghostty_surface_clear_selection(ghostty_surface_t);
+ GHOSTTY_API void ghostty_surface_free_text(ghostty_surface_t, ghostty_text_s*);
+ 
+ #ifdef __APPLE__
+diff --git a/src/Surface.zig b/src/Surface.zig
+index 2c4edc4..294fa58 100644
+--- a/src/Surface.zig
++++ b/src/Surface.zig
+@@ -2391,6 +2391,16 @@ fn setSelectionAndCopy(self: *Surface, sel: terminal.Selection) !void {
+     }
+ }
+ 
++/// Programmatic selection for embedders (apprt API): set or clear the
++/// selection with no clipboard side effects, and schedule a render.
++/// Unlike the mouse path this is never subject to copy-on-select.
++///
++/// This must be called with the renderer mutex held.
++pub fn setSelectionExternal(self: *Surface, sel_: ?terminal.Selection) !void {
++    try self.setSelection(sel_);
++    try self.queueRender();
++}
++
+ /// Change the cell size for the terminal grid. This can happen as
+ /// a result of changing the font size at runtime.
+ fn setCellSize(self: *Surface, size: rendererpkg.CellSize) !void {
+diff --git a/src/apprt/embedded.zig b/src/apprt/embedded.zig
+index 7310159..cd871b5 100644
+--- a/src/apprt/embedded.zig
++++ b/src/apprt/embedded.zig
+@@ -1622,6 +1622,82 @@ pub const CAPI = struct {
+         return readTextLocked(surface, core_sel, result);
+     }
+ 
++    /// Report the current selection's endpoints in active-area
++    /// coordinates, visually ordered (tl is the earlier endpoint
++    /// regardless of drag direction). Returns false when there is no
++    /// selection or an endpoint lies outside the active area (e.g. in
++    /// history), in which case result is untouched.
++    export fn ghostty_surface_selection_info(
++        surface: *Surface,
++        result: *Selection,
++    ) bool {
++        const core_surface = &surface.core_surface;
++        core_surface.renderer_state.mutex.lock();
++        defer core_surface.renderer_state.mutex.unlock();
++
++        const screen = core_surface.io.terminal.screens.active;
++        const sel = screen.selection orelse return false;
++        const tl_pt = screen.pages.pointFromPin(
++            .active,
++            sel.topLeft(screen),
++        ) orelse return false;
++        const br_pt = screen.pages.pointFromPin(
++            .active,
++            sel.bottomRight(screen),
++        ) orelse return false;
++
++        result.* = .{
++            .tl = .{
++                .tag = .active,
++                .coord_tag = .exact,
++                .x = @intCast(tl_pt.coord().x),
++                .y = @intCast(tl_pt.coord().y),
++            },
++            .br = .{
++                .tag = .active,
++                .coord_tag = .exact,
++                .x = @intCast(br_pt.coord().x),
++                .y = @intCast(br_pt.coord().y),
++            },
++            .rectangle = sel.rectangle,
++        };
++        return true;
++    }
++
++    /// Set the selection to the given region, replacing any existing
++    /// one, and schedule a render. Unlike mouse selection this never
++    /// writes any clipboard: copy-on-select does not apply to
++    /// programmatic selection. Returns false when the region cannot be
++    /// resolved.
++    export fn ghostty_surface_set_selection(
++        surface: *Surface,
++        sel: Selection,
++    ) bool {
++        const core_surface = &surface.core_surface;
++        core_surface.renderer_state.mutex.lock();
++        defer core_surface.renderer_state.mutex.unlock();
++
++        const core_sel = sel.core(
++            core_surface.io.terminal.screens.active,
++        ) orelse return false;
++        core_surface.setSelectionExternal(core_sel) catch |err| {
++            log.warn("error setting selection err={}", .{err});
++            return false;
++        };
++        return true;
++    }
++
++    /// Clear any selection, with no clipboard side effects.
++    export fn ghostty_surface_clear_selection(surface: *Surface) void {
++        const core_surface = &surface.core_surface;
++        core_surface.renderer_state.mutex.lock();
++        defer core_surface.renderer_state.mutex.unlock();
++
++        core_surface.setSelectionExternal(null) catch |err| {
++            log.warn("error clearing selection err={}", .{err});
++        };
++    }
++
+     /// Read some arbitrary text from the surface.
+     ///
+     /// This is an expensive operation so it shouldn't be called too
+diff --git a/src/terminal/Screen.zig b/src/terminal/Screen.zig
+index 95cba1b..5472007 100644
+--- a/src/terminal/Screen.zig
++++ b/src/terminal/Screen.zig
+@@ -56,6 +56,12 @@ saved_cursor: ?SavedCursor = null,
+ /// automatically setup tracking.
+ selection: ?Selection = null,
+ 
++/// Wyhash fingerprint of the selection's text at the time it was created
++/// or last deliberately adjusted (in-place scroll translation/clipping).
++/// Repaint frame boundaries compare against it to detect content changing
++/// underneath a selection that didn't move; see `selectionContentCheck`.
++selection_text_hash: ?u64 = null,
++
+ /// The charset state
+ charset: CharsetState = .{},
+ 
+@@ -2616,6 +2622,7 @@ pub fn select(self: *Screen, sel_: ?Selection) Allocator.Error!void {
+     if (self.selection) |*old| old.deinit(self);
+     self.selection = tracked_sel;
+     self.dirty.selection = true;
++    self.rehashSelection();
+ }
+ 
+ /// Same as select(null) but can't fail.
+@@ -2625,6 +2632,58 @@ pub fn clearSelection(self: *Screen) void {
+         self.dirty.selection = true;
+     }
+     self.selection = null;
++    self.selection_text_hash = null;
++}
++
++/// Recompute the content fingerprint the selection is expected to keep
++/// covering. Called after any deliberate selection mutation: creation
++/// (`select`), and in-place region scroll translation/clipping (which
++/// legitimately changes the covered text when an edge row is clipped).
++///
++/// On allocation failure the fingerprint is dropped, which disables the
++/// content check until the next mutation - fail open, so a valid
++/// selection is never cleared spuriously.
++pub fn rehashSelection(self: *Screen) void {
++    self.selection_text_hash = null;
++    const sel = self.selection orelse return;
++    // Only fingerprint selections fully inside the active area: that is
++    // where in-place repaints strike (the tmux/alt-screen case), and it
++    // bounds the cost - a select-all spanning a large scrollback would
++    // otherwise hash megabytes on every mouse-drag tick.
++    if (self.pages.pointFromPin(.active, sel.start()) == null or
++        self.pages.pointFromPin(.active, sel.end()) == null) return;
++    const str = self.selectionString(self.alloc, .{
++        .sel = sel,
++        .trim = false,
++    }) catch return;
++    defer self.alloc.free(str);
++    self.selection_text_hash = std.hash.Wyhash.hash(0, str);
++}
++
++/// Verify the selection still covers the text it covered when it was
++/// created or last translated, and drop it when the content underneath
++/// changed: an untracked in-place repaint (tmux copy-mode entry/exit,
++/// large coalesced scroll jumps, a TUI rewriting rows) moved or replaced
++/// the content, and a highlight must never sit on text the user didn't
++/// select.
++///
++/// tmux-style repaints are bracketed by hide/show cursor (DECRST/DECSET
++/// 25), with the show arriving only after the last cell of a frame is
++/// painted - stream handlers call this at that frame boundary. No-op
++/// without a selection or fingerprint.
++pub fn selectionContentCheck(self: *Screen) void {
++    const expect = self.selection_text_hash orelse return;
++    const sel = self.selection orelse return;
++    const str = self.selectionString(self.alloc, .{
++        .sel = sel,
++        .trim = false,
++    }) catch {
++        // Can't verify: better no highlight than possibly a wrong one.
++        self.clearSelection();
++        return;
++    };
++    defer self.alloc.free(str);
++    if (std.hash.Wyhash.hash(0, str) != expect) self.clearSelection();
+ }
+ 
+ pub const SelectionString = struct {
+diff --git a/src/terminal/Terminal.zig b/src/terminal/Terminal.zig
+index 6a7be16..79248a8 100644
+--- a/src/terminal/Terminal.zig
++++ b/src/terminal/Terminal.zig
+@@ -2444,11 +2444,25 @@ fn rowWillBeShifted(
+ /// [cursor.y, scrolling_region.bottom]) and before any rows are moved.
+ ///
+ /// delta is the number of rows the region content moves: positive is down
+-/// (insertLines), negative is up (deleteLines). A selection endpoint whose
+-/// row content is destroyed by the shift clears the whole selection.
+-fn shiftSelectionForRegionScroll(self: *Terminal, delta: isize) void {
++/// (insertLines), negative is up (deleteLines).
++///
++/// An endpoint whose row content is destroyed by the shift no longer drops
++/// the whole selection: as long as the other endpoint survives inside the
++/// region, the destroyed end is clipped to the region edge it fell off, so
++/// the on-screen remainder stays highlighted and shrinks row by row (the
++/// tmux copy-mode scroll pattern). The selection clears only when all of
++/// its covered content is gone, when it straddles the region boundary (no
++/// representable remainder), or on partial-row left/right margin shifts
++/// (which a selection can't follow).
++///
++/// Returns true when the selection pins were adjusted (translated or
++/// clipped): the caller must refresh the selection content fingerprint
++/// (`Screen.rehashSelection`) once the rows have actually moved - this
++/// runs before the physical shift, so rehashing here would fingerprint
++/// the wrong content.
++fn shiftSelectionForRegionScroll(self: *Terminal, delta: isize) bool {
+     const screen = self.screens.active;
+-    const sel = if (screen.selection) |*v| v else return;
++    const sel = if (screen.selection) |*v| v else return false;
+ 
+     const top: usize = screen.cursor.y;
+     const bottom: usize = self.scrolling_region.bottom;
+@@ -2461,31 +2475,73 @@ fn shiftSelectionForRegionScroll(self: *Terminal, delta: isize) void {
+ 
+     const pins = [2]*PageList.Pin{ sel.startPtr(), sel.endPtr() };
+     var moved: [2]?PageList.Pin = .{ null, null };
++    var gone: [2]bool = .{ false, false };
++    var in_region: [2]bool = .{ false, false };
+     for (pins, 0..) |p, i| {
+         // Pins outside the active area (history) never move: the region
+         // shift only rewrites active rows.
+         const pt = screen.pages.pointFromPin(.active, p.*) orelse continue;
+         const y: usize = @intCast(pt.coord().y);
+         if (y < top or y > bottom) continue;
+-        if (left_right) return screen.clearSelection();
++        if (left_right) {
++            screen.clearSelection();
++            return false;
++        }
++        in_region[i] = true;
+         if (delta > 0) {
+             const d: usize = @intCast(delta);
+             // Content originally in the bottom d rows of the range is lost.
+-            if (y + d > bottom) return screen.clearSelection();
+-            moved[i] = p.down(d).?;
++            if (y + d > bottom) gone[i] = true else moved[i] = p.down(d).?;
+         } else {
+             const d: usize = @intCast(-delta);
+             // Content originally in the top d rows of the range is lost.
+-            if (y < top + d) return screen.clearSelection();
+-            moved[i] = p.up(d).?;
++            if (y < top + d) gone[i] = true else moved[i] = p.up(d).?;
++        }
++    }
++
++    // All covered content destroyed: nothing left to highlight.
++    if (gone[0] and gone[1]) {
++        screen.clearSelection();
++        return false;
++    }
++
++    if (gone[0] or gone[1]) {
++        // One endpoint's content is destroyed. When both endpoints lived
++        // inside the region, clip the destroyed end to the edge it fell
++        // off so the surviving rows stay highlighted. A selection
++        // straddling the region boundary has no representable remainder:
++        // clear it as before.
++        if (!in_region[0] or !in_region[1]) {
++            screen.clearSelection();
++            return false;
++        }
++        for (pins, 0..) |p, i| {
++            if (!gone[i]) continue;
++            // delta < 0 destroys rows at the region top, so the clipped
++            // end is the visually-first one: a linear selection resumes
++            // at the left edge of the surviving top row. delta > 0
++            // mirrors this at the bottom-right. Rectangle selections
++            // keep their column span either way.
++            const x: usize = if (sel.rectangle) x: {
++                const pt = screen.pages.pointFromPin(.active, p.*).?;
++                break :x @intCast(pt.coord().x);
++            } else if (delta < 0) 0 else self.cols - 1;
++            const y: usize = if (delta < 0) top else bottom;
++            moved[i] = screen.pages.pin(.{ .active = .{
++                .x = @intCast(x),
++                .y = @intCast(y),
++            } }).?;
+         }
+     }
+ 
++    var changed = false;
+     for (pins, moved) |p, m| {
+         const new_pin = m orelse continue;
+         p.* = new_pin;
+         screen.dirty.selection = true;
++        changed = true;
+     }
++    return changed;
+ }
+ 
+ /// Insert amount lines at the current cursor row. The contents of the line
+@@ -2543,7 +2599,9 @@ pub fn insertLines(self: *Terminal, count: usize) void {
+ 
+     // Keep the selection glued to the content it covers; the loop below
+     // moves content between row slots without moving tracked pins.
+-    self.shiftSelectionForRegionScroll(@intCast(adjusted_count));
++    const sel_shifted = self.shiftSelectionForRegionScroll(@intCast(adjusted_count));
++    // The pins were adjusted before the rows move; fingerprint after.
++    defer if (sel_shifted) self.screens.active.rehashSelection();
+ 
+     // Create a new tracked pin which we'll use to navigate the page list
+     // so that if we need to adjust capacity it will be properly tracked.
+@@ -2747,7 +2805,9 @@ pub fn deleteLines(self: *Terminal, count: usize) void {
+ 
+     // Keep the selection glued to the content it covers; the loop below
+     // moves content between row slots without moving tracked pins.
+-    self.shiftSelectionForRegionScroll(-@as(isize, @intCast(adjusted_count)));
++    const sel_shifted = self.shiftSelectionForRegionScroll(-@as(isize, @intCast(adjusted_count)));
++    // The pins were adjusted before the rows move; fingerprint after.
++    defer if (sel_shifted) self.screens.active.rehashSelection();
+ 
+     // Create a new tracked pin which we'll use to navigate the page list
+     // so that if we need to adjust capacity it will be properly tracked.
+@@ -14516,3 +14576,259 @@ test "Terminal: insertLines leaves selection above cursor untouched" {
+     defer alloc.free(str);
+     try testing.expectEqualStrings("AAA", str);
+ }
++
++/// Shared 5x5 fixture for the clip tests: rows AAA/BBB/CCC/DDD/EEE.
++fn testClipFixture(alloc: std.mem.Allocator) !Terminal {
++    var t = try init(alloc, .{ .rows = 5, .cols = 5 });
++    errdefer t.deinit(alloc);
++    for ("ABCDE", 0..) |c, i| {
++        t.setCursorPos(i + 1, 1);
++        try t.printString(&.{ c, c, c });
++    }
++    return t;
++}
++
++test "Terminal: deleteLines clips selection at destroyed top rows" {
++    const Selection = @import("Selection.zig");
++    const alloc = testing.allocator;
++    var t = try testClipFixture(alloc);
++    defer t.deinit(alloc);
++
++    // Rows 1-3 (BBB/CCC/DDD), columns 1..1 on the partial edge rows.
++    const screen = t.screens.active;
++    try screen.select(Selection.init(
++        screen.pages.pin(.{ .active = .{ .x = 1, .y = 1 } }).?,
++        screen.pages.pin(.{ .active = .{ .x = 1, .y = 3 } }).?,
++        false,
++    ));
++
++    // Shift up by 2: rows 0-1 destroyed, first selected row (BBB) gone.
++    t.setCursorPos(1, 1);
++    t.deleteLines(2);
++
++    // Remainder survives: full CCC row (clip restarts at the left edge)
++    // down to the original partial DDD coverage.
++    const sel = screen.selection orelse return error.TestExpectedClip;
++    try testing.expectEqual(
++        point.Point{ .active = .{ .x = 0, .y = 0 } },
++        screen.pages.pointFromPin(.active, sel.start()).?,
++    );
++    const str = try screen.selectionString(alloc, .{ .sel = sel });
++    defer alloc.free(str);
++    try testing.expectEqualStrings("CCC\nDD", str);
++}
++
++test "Terminal: insertLines clips selection at destroyed bottom rows" {
++    const Selection = @import("Selection.zig");
++    const alloc = testing.allocator;
++    var t = try testClipFixture(alloc);
++    defer t.deinit(alloc);
++
++    // Rows 2-3 (CCC/DDD).
++    const screen = t.screens.active;
++    try screen.select(Selection.init(
++        screen.pages.pin(.{ .active = .{ .x = 1, .y = 2 } }).?,
++        screen.pages.pin(.{ .active = .{ .x = 1, .y = 3 } }).?,
++        false,
++    ));
++
++    // Shift down by 2: DDD pushed past the bottom, CCC lands on row 4.
++    t.setCursorPos(1, 1);
++    t.insertLines(2);
++
++    const sel = screen.selection orelse return error.TestExpectedClip;
++    try testing.expectEqual(
++        point.Point{ .active = .{ .x = 1, .y = 4 } },
++        screen.pages.pointFromPin(.active, sel.start()).?,
++    );
++    try testing.expectEqual(
++        point.Point{ .active = .{ .x = 4, .y = 4 } },
++        screen.pages.pointFromPin(.active, sel.end()).?,
++    );
++    const str = try screen.selectionString(alloc, .{ .sel = sel });
++    defer alloc.free(str);
++    try testing.expectEqualStrings("CC", str);
++}
++
++test "Terminal: selection shrinks row by row across successive deleteLines" {
++    const Selection = @import("Selection.zig");
++    const alloc = testing.allocator;
++    var t = try testClipFixture(alloc);
++    defer t.deinit(alloc);
++
++    // Rows 2-4 (CCC/DDD/EEE), partial columns on both edge rows.
++    const screen = t.screens.active;
++    try screen.select(Selection.init(
++        screen.pages.pin(.{ .active = .{ .x = 1, .y = 2 } }).?,
++        screen.pages.pin(.{ .active = .{ .x = 1, .y = 4 } }).?,
++        false,
++    ));
++
++    const expected = [_]?[]const u8{
++        "CC\nDDD\nEE", // still fully on screen, just translated
++        "CC\nDDD\nEE",
++        "DDD\nEE", // first selected row destroyed: whole-row resume
++        "EE", // only the last partial row left
++        null, // everything gone
++    };
++    for (expected) |want| {
++        t.setCursorPos(1, 1);
++        t.deleteLines(1);
++        const sel = screen.selection orelse {
++            try testing.expect(want == null);
++            continue;
++        };
++        const str = try screen.selectionString(alloc, .{ .sel = sel });
++        defer alloc.free(str);
++        try testing.expectEqualStrings(want.?, str);
++    }
++}
++
++test "Terminal: deleteLines clip handles reverse-drag selection" {
++    const Selection = @import("Selection.zig");
++    const alloc = testing.allocator;
++    var t = try testClipFixture(alloc);
++    defer t.deinit(alloc);
++
++    // Same coverage as the shrink test but dragged bottom-up: the pin
++    // that gets destroyed is the END pin.
++    const screen = t.screens.active;
++    try screen.select(Selection.init(
++        screen.pages.pin(.{ .active = .{ .x = 1, .y = 4 } }).?,
++        screen.pages.pin(.{ .active = .{ .x = 1, .y = 2 } }).?,
++        false,
++    ));
++
++    for (0..3) |_| {
++        t.setCursorPos(1, 1);
++        t.deleteLines(1);
++    }
++
++    const sel = screen.selection orelse return error.TestExpectedClip;
++    const str = try screen.selectionString(alloc, .{ .sel = sel });
++    defer alloc.free(str);
++    try testing.expectEqualStrings("DDD\nEE", str);
++}
++
++test "Terminal: rectangle selection clip keeps column span" {
++    const Selection = @import("Selection.zig");
++    const alloc = testing.allocator;
++    var t = try init(alloc, .{ .rows = 5, .cols = 5 });
++    defer t.deinit(alloc);
++
++    for ("ABCDE", 0..) |c, i| {
++        t.setCursorPos(i + 1, 1);
++        try t.printString(&.{ c, c, c, c, c });
++    }
++
++    const screen = t.screens.active;
++    try screen.select(Selection.init(
++        screen.pages.pin(.{ .active = .{ .x = 1, .y = 1 } }).?,
++        screen.pages.pin(.{ .active = .{ .x = 3, .y = 3 } }).?,
++        true,
++    ));
++
++    t.setCursorPos(1, 1);
++    t.deleteLines(2);
++
++    const sel = screen.selection orelse return error.TestExpectedClip;
++    try testing.expectEqual(
++        point.Point{ .active = .{ .x = 1, .y = 0 } },
++        screen.pages.pointFromPin(.active, sel.start()).?,
++    );
++    const str = try screen.selectionString(alloc, .{ .sel = sel });
++    defer alloc.free(str);
++    try testing.expectEqualStrings("CCC\nDDD", str);
++}
++
++test "Terminal: selection content check keeps selection over identical repaint" {
++    const Selection = @import("Selection.zig");
++    const alloc = testing.allocator;
++    var t = try testClipFixture(alloc);
++    defer t.deinit(alloc);
++
++    const screen = t.screens.active;
++    try screen.select(Selection.init(
++        screen.pages.pin(.{ .active = .{ .x = 0, .y = 1 } }).?,
++        screen.pages.pin(.{ .active = .{ .x = 2, .y = 1 } }).?,
++        false,
++    ));
++
++    // tmux-style in-place repaint of the same content (copy-mode entry).
++    t.setCursorPos(2, 1);
++    try t.printString("BBB");
++
++    screen.selectionContentCheck();
++    try testing.expect(screen.selection != null);
++}
++
++test "Terminal: selection content check clears when content changes underneath" {
++    const Selection = @import("Selection.zig");
++    const alloc = testing.allocator;
++    var t = try testClipFixture(alloc);
++    defer t.deinit(alloc);
++
++    const screen = t.screens.active;
++    try screen.select(Selection.init(
++        screen.pages.pin(.{ .active = .{ .x = 0, .y = 1 } }).?,
++        screen.pages.pin(.{ .active = .{ .x = 2, .y = 1 } }).?,
++        false,
++    ));
++
++    // An in-place repaint that moved content (no IL/DL): row 1 now holds
++    // different text while the selection pins never moved.
++    t.setCursorPos(2, 1);
++    try t.printString("XXX");
++
++    screen.selectionContentCheck();
++    try testing.expect(screen.selection == null);
++}
++
++test "Terminal: fingerprint refreshes after clip so content check keeps remainder" {
++    const Selection = @import("Selection.zig");
++    const alloc = testing.allocator;
++    var t = try testClipFixture(alloc);
++    defer t.deinit(alloc);
++
++    const screen = t.screens.active;
++    try screen.select(Selection.init(
++        screen.pages.pin(.{ .active = .{ .x = 1, .y = 2 } }).?,
++        screen.pages.pin(.{ .active = .{ .x = 1, .y = 4 } }).?,
++        false,
++    ));
++
++    // Clip changes the covered text (whole-row resume) AND the rows only
++    // move after the pins are adjusted: the fingerprint must be computed
++    // from the post-move content, or this check would wrongly clear.
++    t.setCursorPos(1, 1);
++    t.deleteLines(3);
++
++    screen.selectionContentCheck();
++    const sel = screen.selection orelse return error.TestExpectedKeep;
++    const str = try screen.selectionString(alloc, .{ .sel = sel });
++    defer alloc.free(str);
++    try testing.expectEqualStrings("DDD\nEE", str);
++}
++
++test "Terminal: clip clears selection straddling the region boundary" {
++    const Selection = @import("Selection.zig");
++    const alloc = testing.allocator;
++    var t = try testClipFixture(alloc);
++    defer t.deinit(alloc);
++
++    // Selection spans row 0 (outside the region) into row 1 (region top).
++    const screen = t.screens.active;
++    try screen.select(Selection.init(
++        screen.pages.pin(.{ .active = .{ .x = 0, .y = 0 } }).?,
++        screen.pages.pin(.{ .active = .{ .x = 2, .y = 1 } }).?,
++        false,
++    ));
++
++    // DECSTBM rows 2-4 (1-based); destroying row 1 leaves no
++    // representable remainder for the straddling selection.
++    t.setTopAndBottomMargin(2, 4);
++    t.setCursorPos(2, 1);
++    t.deleteLines(1);
++
++    try testing.expect(screen.selection == null);
++}
+diff --git a/src/terminal/res/tmux_wheel_dup_attach.raw b/src/terminal/res/tmux_wheel_dup_attach.raw
+new file mode 100644
+index 0000000000000000000000000000000000000000..6bce985af72aa9069a57e9c1c9b2b4ffafb0c787
+GIT binary patch
+literal 1849
+zcmeHHy>7xV5FU|`cmgksT};l-A8FJgRaHe>hAvDlgK-=MDIsZM5D!!J;rb-CLn_ms
+zjSi?{u<!d$=TGOm(;+q?;6)i?l*SN)LfVm`E5xSS^<Wsy^-X;pqC)`;)3)_$>vlZo
+ztlvfhcqX2LtHszPih?z|xIwHikG~3jKKxCX#6+h-V(Qh13B<0=c|i*T@dQ0<OIpjQ
+z7ZZPq77(vjB_5CRQt-To7Ga#Oa(U@E2X3dTS6i;6ql(HAIo~7_`#>B#Z)DxzM)4Zg
+zvMO=GMcLp)ZgC@JQfzj3&DClv9S~f&9xU-vrYZJl!f}))6q7Jb+#r?UM!wUCnk$i2
+zJn5N2n6gao?q@ShqA_BRgMLRMODKRQh`Cgki4=qW``hbqsCiIWwS5_ff~#TsgQnOe
+zn`)$Xx^r6fcK(EcSV%2&E%Yq(EetFSE!=0@>Y7~tMSAT&4hNBpb@_;=jvmr|r_J1+
+jn|&g)_@mioeYNW;3~87h-}1ke>vq|BXPnqd`!+@&H{9P^
+
+literal 0
+HcmV?d00001
+
+diff --git a/src/terminal/res/tmux_wheel_dup_scroll.raw b/src/terminal/res/tmux_wheel_dup_scroll.raw
+new file mode 100644
+index 0000000000000000000000000000000000000000..ac7aea7d7f0174e363b33c9823926714f965b6af
+GIT binary patch
+literal 3984
+zcmeH~zi!(w5XN@{dIBvTyQHzi|Hu%aEs7L%fi9gi8TOE&0*pol@-Rgou20ev$*ZX2
+zhrr3yA%l(MXOiacyAw&Z!)<TAx5M4XPy78<7fd^RZZ^4L%Z4i(zHEf0(eHNDXb07g
+z?a+<Q=Fjh6+by;2_;CDjn2z`7!>N7qt{ukh@i1+#r}2FKFg~7sp5IQ7Q=I6-x35>b
+zZVCG(R7<FrFs(TbODm3HT5k-~YGXLB^}ktOJKT0XnNKOWkKc1#D0k%Ho<27nr-!I(
+zkzA=oa;?`lj($i9etKTAyPkqlS&5zutVJ@I{;Z=Pa^flNDa)ugWu~5jGFOX~*;+&%
+zc;ta659;9v)gx4gP~Edo9YS>o)ge@eP#r>b2-P7}hfpm-wS-#PXAzM_L>3WQL}U?>
+zjRkzVsC+E~wFuN8P=i1X0yPNKAW(xq4FWYNbp{a`M5GasMnoDBX+)$Ekw!!s5otuE
+z5s^kj3K1zpq!5upL<$ipM5GXrdb$|D<n1pVn_MJ9&1)4ZVd4E*^vj;CRW5O%lGB&W
+zIX_|Z^DRbaexYWogqmFyYEFPqAwTaiqA#T7oon5fH#wm~Hr_f#U&zKAvgixhc$*h}
+zbIA%7vhe}5?(6e2BUH%7C!pvH**wgfhio3^%|kX1*+PEE*DDJbR%w8=0aj^%wDX;|
+zuJZtC1EdX*HXzz~0WSZoyb?X*Cft<c%BvK+7;m%WVXwr!s}Xmv)c|2;oJ3d|HDP4b
+zgpE-XCPqzI7&T#F)P#K{@T*bzM0u%E>+%^o^`2`eoecawL3vqT_b4IUczus+Hqm=}
+h5Xh4lQvGvCWzQj1JBP_kPT7U8nKYb^>whnOe*w96+eiQa
+
+literal 0
+HcmV?d00001
+
+diff --git a/src/terminal/res/tmux_wheel_flick_attach.raw b/src/terminal/res/tmux_wheel_flick_attach.raw
+new file mode 100644
+index 0000000000000000000000000000000000000000..25f165b0cb4a1cad90b82fda2d700f6b8dbf0bf8
+GIT binary patch
+literal 1675
+zcmeH{OKQU~5Qdk5Ku(}dmffg&SbnIc4HOFLgYLRgvrudq8|>J%ozTOS9<C>;<T!K+
+z-KE)OVGsW>8a_0?2B`(3Lgq+u9@Cii$R=`hjnvYn9-QK({d3=z*iuTJvT?}T=#4rU
+zqd!zrDqKCMo^7TUQU)7zaf?*t4*za=IQUm%7Bh>%VlG;w5~Ob2_l8!C#tZanBO9XP
+zB4+*)t!TU{Y8+jbb)w4&T7_{|l;(;MkS0xA>~wEPUo|8t^)@xwr;Om2&a@rwdfnpI
+zG&QbtQg=8tJKPzQR@-;H(S5NqgeE%i1YP5`$ucZ>s<F&cj#-$cUXU5;NuP8{tNSEx
+zbUJYt;jU%*bpL#ZMHnIVIGc__0ufOt7!(`|4+;T=4@Ce)2n8gFAc2Gg5)w#AAR&Q-
+z1QHTRNFX7Bgai^0_|y>~<#B5jR?VhgpC9wN)j{=hqkAjatSy9gVv)5k6aCRv+t16n
+k?>w@DQ%^H8w@QXp5r#a>k00Fswj1}#`Tg3pb@KQ74KYiT?f?J)
+
+literal 0
+HcmV?d00001
+
+diff --git a/src/terminal/res/tmux_wheel_flick_scroll.raw b/src/terminal/res/tmux_wheel_flick_scroll.raw
+new file mode 100644
+index 0000000000000000000000000000000000000000..7b2f8892cb9449a7146b48aac17351b69683839b
+GIT binary patch
+literal 11523
+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
+
+literal 0
+HcmV?d00001
+
+diff --git a/src/terminal/res/tmux_wheel_slow_attach.raw b/src/terminal/res/tmux_wheel_slow_attach.raw
+new file mode 100644
+index 0000000000000000000000000000000000000000..ab06bff14a0ebfd2d3eca4ffca45b66a4c062796
+GIT binary patch
+literal 1754
+zcmeH{OKQU~5Qdk5Ku(}dmffg&SbnIc4HOFLgYLRgvrudq8|>J%ozTOS9<C>;<T!K+
+z-Gx9GS=hrrjE0YypFwKDsE|2QoX0e#J+g@$T_d%$sRyTcY5&}}CAO4Or)(UuHhQBD
+z#^?{#lnPhRsb`z1g_OYtUECs7xyQd79v=SHn8nOuu$YS$sRXGT_r0MNqwxa0+Q^2e
+zxQLm*L@OF^iW*0kWu549f>vRi6{Wc%1f)sR7CYS=(pL>hO1(`D_9-Lyr88}ZyI!}r
+zHBF5xozxvp%?@|Qq}BEvZ**Vm455imJVDoZZL$mto@y+!lw%fVsTX91deSFd(&|3R
+z8=X$vAlz7%PxsGvScDN$kF)70BoGmWf<eKd@SqS-_)r8;git_&2ogw0AR&Q-1QHTR
+zNFX7Bgai^2NJt<7flnO)QXaQfVbyH<_4zTMTOCwC6Wv?MW^Ey~6N{{UndpzU+J0Zo
+kedm=OoO+s-xl=NniZJA1e*EJ8b-VFQozH>2f+s%*-vxrE+yDRo
+
+literal 0
+HcmV?d00001
+
+diff --git a/src/terminal/res/tmux_wheel_slow_scroll.raw b/src/terminal/res/tmux_wheel_slow_scroll.raw
+new file mode 100644
+index 0000000000000000000000000000000000000000..2eee63fbc79be4ec22e4c7d190d82a2b2566b894
+GIT binary patch
+literal 12725
+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
+
+literal 0
+HcmV?d00001
+
+diff --git a/src/terminal/res/tmux_wheel_split_attach.raw b/src/terminal/res/tmux_wheel_split_attach.raw
+new file mode 100644
+index 0000000000000000000000000000000000000000..312d063735ea6192a64a176c60e03467ce50c4c6
+GIT binary patch
+literal 925
+zcmeH_O$x$53`X~YC&&fd2+4F>8wM>1f`52{=*mqODk$C`Gqu7exDmH5+VDaq^WYn@
+zMmTCq7DD30ck)I{Q?jME)|tY||Dp5|A7#$uwd;B<dan9fcGJu;&j&7inKi1_g+_C-
+zb3XjO@OALhVoBl}l0v+Z9m!_-yV5~8HMI9CU9}LqLAUhVm)q5DF^-d(Y%?76pa3-^
+z2tq(85F$c}P$5hZ(4a;GMFT|xMFT|xMFT|xMFT|xMFRzclAi`{`<{r@{sJW4e@^R}
+OMGo*E$Lke-8^;53J<v7)
+
+literal 0
+HcmV?d00001
+
+diff --git a/src/terminal/res/tmux_wheel_split_scroll.raw b/src/terminal/res/tmux_wheel_split_scroll.raw
+new file mode 100644
+index 0000000000000000000000000000000000000000..0499d4251bf4f759b3fafa1b495237de0b93cb1f
+GIT binary patch
+literal 3559
+zcmeH~v1-FW5JdYxzTkc!P2hCCJ>8N*5C}NL$q%Sa;Ua1B|Al8|i7bYgS<<?&>=nal
+zG*6aBX`YIFrFnmN{djq-V^8zj{oOjK8+!J`;D_Reogb<n#1G96qaVD3?j5Lipx%Lc
+z2kITDcc9*ZdI#zqsCS^wf#kCTxJ~mk6vT$`j?315yFL3f4+ngnhAmheq0~=K3v09%
+z=R|7}2CYSkv=;HxT5zMah?~_maH6#UOlt$&T7X*%aBBf>Ex@e>xU~Sc7T_iUZW7=o
+z0d5lDCIM~|;3ffX65u8QZW7>D1KjF$ZtwPQ{Jl})<j#+z%lqkt4uMfRK%jI0OX+a2
+zP&!<Iln&ugIt0$>>^V*8aA8n7l1C?bbdpCWd32ITCwX*|M<;n$YhiM>LPP0D9#(^>
+z^++C8o~ZRm9#*-i^++Dd@mM<C_2X{7w&n%{w@U0Xu%x#@{;tI1SjJ;|cuw;-0(I4R
+j8ggz+UCueL-%FLo{vBrP%(gA{XMHf-fY__qzur+!c^OU}
+
+literal 0
+HcmV?d00001
+
+diff --git a/src/terminal/stream_terminal.zig b/src/terminal/stream_terminal.zig
+index c635e91..74ca952 100644
+--- a/src/terminal/stream_terminal.zig
++++ b/src/terminal/stream_terminal.zig
+@@ -533,6 +533,13 @@ pub const Handler = struct {
+ 
+             .origin => self.terminal.setCursorPos(1, 1),
+ 
++            // tmux-style repaints are bracketed by hide/show cursor, with
++            // the show arriving only after the last cell of a frame is
++            // painted. At that frame boundary, verify the selection still
++            // covers its original text (no-op without a selection).
++            .cursor_visible => if (enabled)
++                self.terminal.screens.active.selectionContentCheck(),
++
+             .enable_left_and_right_margin => if (!enabled) {
+                 self.terminal.scrolling_region.left = 0;
+                 self.terminal.scrolling_region.right = self.terminal.cols - 1;
+@@ -2423,3 +2430,258 @@ test "kitty graphics via APC" {
+     const img = storage.imageById(1).?;
+     try testing.expectEqual(.rgb, img.format);
+ }
++
++test "modes: cursor show verifies selection content at frame boundary" {
++    const Selection = @import("Selection.zig");
++    const alloc = testing.allocator;
++    var t: Terminal = try .init(alloc, .{ .cols = 10, .rows = 5 });
++    defer t.deinit(alloc);
++
++    var s: Stream = .initAlloc(alloc, .init(&t));
++    defer s.deinit();
++
++    s.nextSlice("AAA\r\nBBB\r\nCCC");
++    const screen = t.screens.active;
++    try screen.select(Selection.init(
++        screen.pages.pin(.{ .active = .{ .x = 0, .y = 1 } }).?,
++        screen.pages.pin(.{ .active = .{ .x = 2, .y = 1 } }).?,
++        false,
++    ));
++
++    // Identical in-place repaint frame (tmux copy-mode entry shape):
++    // hide cursor, repaint the same rows, show cursor. Selection stays.
++    s.nextSlice("\x1b[?25l\x1b[HAAA\x1b[K\r\nBBB\x1b[K\r\nCCC\x1b[K\x1b[?25h");
++    try testing.expect(screen.selection != null);
++
++    // In-place repaint that moved content one row up with no IL/DL (a
++    // coalesced scroll jump): at the frame boundary the highlight would
++    // sit on the wrong text, so it must drop.
++    s.nextSlice("\x1b[?25l\x1b[HBBB\x1b[K\r\nCCC\x1b[K\r\nDDD\x1b[K\x1b[?25h");
++    try testing.expect(screen.selection == null);
++}
++
++// The following tests replay REAL captured tmux byte streams (tmux 3.6a,
++// 80x24 client, TERM=xterm-256color, Seedmux private conf replica; client
++// pty output captured verbatim - see res/tmux_wheel_*.raw).
++//
++// The v4 selection contract they pin down:
++//   - while any part of the selection is on screen, the highlight covers a
++//     contiguous run of the originally selected lines - never other text;
++//   - at a screen edge it shrinks row by row (clip), not all at once;
++//   - once fully off screen it clears, and scrolling back does NOT revive
++//     it kernel-side: revival from the multiplexer's true scroll position
++//     is the host's job.
++//
++// tmux repaint frames are bracketed by hide/show cursor and the show
++// (DECSET 25) arrives only after the last cell of the frame, so streams
++// are fed frame by frame split on that marker and every assertion runs at
++// a frame boundary - exactly the moments a user can see or copy.
++
++/// Feed `bytes` frame by frame; after each frame assert the selection (if
++/// any) covers a contiguous run of `original` lines. Returns whether some
++/// frame showed a proper partial run (the clip path really ran).
++fn replayExpectContiguousRuns(
++    s: *Stream,
++    t: *Terminal,
++    bytes: []const u8,
++    original: []const []const u8,
++) !bool {
++    const alloc = testing.allocator;
++    const full = try std.mem.join(alloc, "\n", original);
++    defer alloc.free(full);
++
++    var saw_partial = false;
++    var rest = bytes;
++    const marker = "\x1b[?25h";
++    while (rest.len > 0) {
++        const end = if (std.mem.indexOf(u8, rest, marker)) |idx|
++            idx + marker.len
++        else
++            rest.len;
++        s.nextSlice(rest[0..end]);
++        rest = rest[end..];
++
++        const screen = t.screens.active;
++        const sel = screen.selection orelse continue;
++        const str = try screen.selectionString(alloc, .{ .sel = sel });
++        defer alloc.free(str);
++
++        var matched = false;
++        for (0..original.len) |i| {
++            for (i..original.len) |j| {
++                const run = try std.mem.join(alloc, "\n", original[i .. j + 1]);
++                defer alloc.free(run);
++                if (std.mem.eql(u8, str, run)) matched = true;
++            }
++        }
++        if (!matched) {
++            std.debug.print(
++                "selection on unexpected text at frame boundary: '{s}'\n",
++                .{str},
++            );
++            return error.SelectionOnWrongText;
++        }
++        if (!std.mem.eql(u8, str, full)) saw_partial = true;
++    }
++    return saw_partial;
++}
++
++test "Terminal: real tmux split-entry scroll-up follows, clips at bottom, clears" {
++    const Selection = @import("Selection.zig");
++    const alloc = testing.allocator;
++    var t: Terminal = try .init(alloc, .{ .cols = 80, .rows = 24 });
++    defer t.deinit(alloc);
++
++    var s: Stream = .initAlloc(alloc, .init(&t));
++    defer s.deinit();
++
++    // Attach: LINE-478..LINE-500 on rows 0..22, blank row 23.
++    s.nextSlice(@embedFile("res/tmux_wheel_split_attach.raw"));
++
++    const screen = t.screens.active;
++    try screen.select(Selection.init(
++        screen.pages.pin(.{ .active = .{ .x = 0, .y = 8 } }).?,
++        screen.pages.pin(.{ .active = .{ .x = 7, .y = 10 } }).?,
++        false,
++    ));
++
++    // Only the scroll-up half: copy-mode entry as its own command
++    // (identical-content repaint - the Seedmux bridge splits entry from
++    // the first scroll so the kernel can track every tick), then 30
++    // single-line ILs. The scroll-down half is the next test.
++    const capture: []const u8 = @embedFile("res/tmux_wheel_split_scroll.raw");
++    const first_dl = std.mem.indexOf(u8, capture, "\x1b[1M").?;
++    const up_end = std.mem.lastIndexOf(
++        u8,
++        capture[0..first_dl],
++        "\x1b[?25h",
++    ).? + "\x1b[?25h".len;
++
++    const saw_partial = try replayExpectContiguousRuns(
++        &s,
++        &t,
++        capture[0..up_end],
++        &.{ "LINE-486", "LINE-487", "LINE-488" },
++    );
++
++    // 30 lines up moved the selection out the bottom edge: it must have
++    // shrunk row by row on the way (clip really ran), and be gone now.
++    try testing.expect(saw_partial);
++    try testing.expect(screen.selection == null);
++}
++
++test "Terminal: real tmux split-entry scroll-down clips at top edge" {
++    const Selection = @import("Selection.zig");
++    const alloc = testing.allocator;
++    var t: Terminal = try .init(alloc, .{ .cols = 80, .rows = 24 });
++    defer t.deinit(alloc);
++
++    var s: Stream = .initAlloc(alloc, .init(&t));
++    defer s.deinit();
++
++    s.nextSlice(@embedFile("res/tmux_wheel_split_attach.raw"));
++
++    // Play the whole scroll-up half first (no selection yet), leaving the
++    // view 30 lines back: LINE-448 on row 0.
++    const capture: []const u8 = @embedFile("res/tmux_wheel_split_scroll.raw");
++    const first_dl = std.mem.indexOf(u8, capture, "\x1b[1M").?;
++    const up_end = std.mem.lastIndexOf(
++        u8,
++        capture[0..first_dl],
++        "\x1b[?25h",
++    ).? + "\x1b[?25h".len;
++    s.nextSlice(capture[0..up_end]);
++
++    // Now select near the TOP and replay the scroll-down half: content
++    // moves up via DLs, so the selection walks out the top edge and must
++    // clip there row by row (and never revive after it is gone - the
++    // stream ends with copy-mode auto-exit's full repaint).
++    const screen = t.screens.active;
++    try screen.select(Selection.init(
++        screen.pages.pin(.{ .active = .{ .x = 0, .y = 2 } }).?,
++        screen.pages.pin(.{ .active = .{ .x = 7, .y = 4 } }).?,
++        false,
++    ));
++    {
++        const str = try screen.selectionString(alloc, .{
++            .sel = screen.selection.?,
++        });
++        defer alloc.free(str);
++        try testing.expectEqualStrings("LINE-450\nLINE-451\nLINE-452", str);
++    }
++
++    const saw_partial = try replayExpectContiguousRuns(
++        &s,
++        &t,
++        capture[up_end..],
++        &.{ "LINE-450", "LINE-451", "LINE-452" },
++    );
++
++    try testing.expect(saw_partial);
++    try testing.expect(screen.selection == null);
++}
++
++test "Terminal: real tmux coalesced-entry scroll never shows a stale highlight" {
++    // The legacy command shape (`copy-mode -e ; send-keys -X -N 5
++    // scroll-up` in ONE invocation) makes tmux emit an entry repaint that
++    // already carries the first tick's shift - in-place, no IL/DL. The
++    // ledger cannot track that; the frame-boundary content check must
++    // drop the selection instead of leaving it on the wrong text.
++    const Selection = @import("Selection.zig");
++    const alloc = testing.allocator;
++    var t: Terminal = try .init(alloc, .{ .cols = 80, .rows = 24 });
++    defer t.deinit(alloc);
++
++    var s: Stream = .initAlloc(alloc, .init(&t));
++    defer s.deinit();
++
++    // Attach: LINE-478..LINE-500 on rows 0..22, prompt on row 23.
++    s.nextSlice(@embedFile("res/tmux_wheel_slow_attach.raw"));
++
++    const screen = t.screens.active;
++    try screen.select(Selection.init(
++        screen.pages.pin(.{ .active = .{ .x = 0, .y = 12 } }).?,
++        screen.pages.pin(.{ .active = .{ .x = 7, .y = 12 } }).?,
++        false,
++    ));
++
++    _ = try replayExpectContiguousRuns(
++        &s,
++        &t,
++        @embedFile("res/tmux_wheel_slow_scroll.raw"),
++        &.{"LINE-490"},
++    );
++    try testing.expect(screen.selection == null);
++}
++
++test "Terminal: real tmux flick with identical blocks never lands on the other copy" {
++    // Two byte-identical 9-row blocks on screen; select DUP-05 in the
++    // SECOND block, wheel out ~66 lines and back. v2.1-v3.1's content
++    // rescan could revive the highlight on the FIRST block's copy; v4 has
++    // no rescan at all - the frame checks only ever compare the covered
++    // text, so the worst case is a clean drop, never a jump.
++    const Selection = @import("Selection.zig");
++    const alloc = testing.allocator;
++    var t: Terminal = try .init(alloc, .{ .cols = 80, .rows = 24 });
++    defer t.deinit(alloc);
++
++    var s: Stream = .initAlloc(alloc, .init(&t));
++    defer s.deinit();
++
++    s.nextSlice(@embedFile("res/tmux_wheel_dup_attach.raw"));
++
++    const screen = t.screens.active;
++    try screen.select(Selection.init(
++        screen.pages.pin(.{ .active = .{ .x = 0, .y = 18 } }).?,
++        screen.pages.pin(.{ .active = .{ .x = 5, .y = 18 } }).?,
++        false,
++    ));
++
++    _ = try replayExpectContiguousRuns(
++        &s,
++        &t,
++        @embedFile("res/tmux_wheel_dup_scroll.raw"),
++        &.{"DUP-05"},
++    );
++    try testing.expect(screen.selection == null);
++}
+diff --git a/src/termio/stream_handler.zig b/src/termio/stream_handler.zig
+index 43c5d61..1285c8f 100644
+--- a/src/termio/stream_handler.zig
++++ b/src/termio/stream_handler.zig
+@@ -711,6 +711,13 @@ pub const StreamHandler = struct {
+             // not the value changed.
+             .origin => self.terminal.setCursorPos(1, 1),
+ 
++            // tmux-style repaints are bracketed by hide/show cursor, with
++            // the show arriving only after the last cell of a frame is
++            // painted. At that frame boundary, verify the selection still
++            // covers its original text (no-op without a selection).
++            .cursor_visible => if (enabled)
++                self.terminal.screens.active.selectionContentCheck(),
++
+             .enable_left_and_right_margin => if (!enabled) {
+                 // When we disable left/right margin mode we need to
+                 // reset the left/right margins.
